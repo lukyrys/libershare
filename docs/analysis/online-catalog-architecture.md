@@ -72,7 +72,7 @@ This is a **signed 2P-Set** (grow-only set of additions + grow-only set of delet
 │  │     - Roles: owner, admins, moderators                  │ │
 │  │     - restrictCatalogWrites flag                        │ │
 │  │                                                          │ │
-│  │  4. Vector Clock: Map<peerID, lamportClock>             │ │
+│  │  4. Vector Clock: Map<peerID, HLC>                     │ │
 │  │     - Tracks what each peer has seen                    │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │                                                               │
@@ -199,11 +199,17 @@ Every catalog operation (add, remove, ACL change) MUST include an Ed25519 signat
 
 ```typescript
 interface SignedOperation {
-  op: 'publish' | 'remove' | 'acl_update';
+  op: 'add' | 'remove' | 'acl_grant' | 'acl_revoke';
   payload: CatalogEntry | TombstoneEntry | ACLChange;
   authorPeerID: string;        // Who created this operation
   hlc: HLC;                   // Hybrid Logical Clock (monotonically increasing per author)
   signature: string;           // Ed25519 sign(payload + authorPeerID + hlc)
+}
+
+interface ACLChange {
+  action: 'grant' | 'revoke';
+  role: 'admin' | 'moderator';
+  peerIDs: string[];
 }
 ```
 
@@ -211,7 +217,7 @@ interface SignedOperation {
 
 - **Payload tampering**: Changing any field invalidates the signature
 - **Author spoofing**: Only the real author's private key can produce a valid signature
-- **Clock manipulation**: Lamport clock is part of the signed data
+- **Clock manipulation**: HLC is part of the signed data
 
 #### 4.3 Authorization Chain (Chain of Trust)
 
@@ -244,11 +250,11 @@ function validateOperation(op: SignedOperation, currentACL: ICatalogAccess): Val
 
   // 2. Check authorization based on operation type
   switch (op.op) {
-    case 'publish':
-      // If restricted, only owner/admin/moderator can publish
+    case 'add':
+      // If restricted, only owner/admin/moderator can add
       if (currentACL.restrictCatalogWrites) {
         if (!isOwnerOrAdminOrModerator(op.authorPeerID, currentACL)) {
-          return { valid: false, reason: 'UNAUTHORIZED_PUBLISH' };
+          return { valid: false, reason: 'UNAUTHORIZED_ADD' };
         }
       }
       break;
@@ -260,7 +266,8 @@ function validateOperation(op: SignedOperation, currentACL: ICatalogAccess): Val
       }
       break;
 
-    case 'acl_update':
+    case 'acl_grant':
+    case 'acl_revoke':
       const change = op.payload as ACLChange;
       if (change.role === 'admin') {
         // Only owner can manage admins
@@ -271,6 +278,13 @@ function validateOperation(op: SignedOperation, currentACL: ICatalogAccess): Val
         // Owner or admin can manage moderators
         if (!isOwnerOrAdmin(op.authorPeerID, currentACL)) {
           return { valid: false, reason: 'UNAUTHORIZED_ACL_CHANGE' };
+        }
+      }
+      // Anti-escalation: cannot grant role you don't hold (Matrix Rule 9)
+      if (op.op === 'acl_grant') {
+        const authorRole = getRole(op.authorPeerID, currentACL);
+        if (roleLevel(change.role) >= roleLevel(authorRole)) {
+          return { valid: false, reason: 'ANTI_ESCALATION_VIOLATION' };
         }
       }
       break;
@@ -525,10 +539,10 @@ This provides probabilistic proof that a publisher actually holds the content th
 For live operations while peers are connected. Messages are small JSON payloads broadcast to the `lish/<networkID>` topic.
 
 ```typescript
-// Publish a LISH to catalog
+// Add a LISH to catalog
 {
   type: 'catalog_op',
-  op: 'publish',
+  op: 'add',
   entry: CatalogEntry,
   authorPeerID: string,
   hlc: HLC,
@@ -545,11 +559,11 @@ For live operations while peers are connected. Messages are small JSON payloads 
   signature: string
 }
 
-// Update ACL
+// Grant or revoke ACL role
 {
   type: 'catalog_op',
-  op: 'acl_update',
-  change: { action: 'add'|'remove', role: 'admin'|'moderator', peerIDs: string[] },
+  op: 'acl_grant' | 'acl_revoke',
+  change: ACLChange,
   authorPeerID: string,
   hlc: HLC,
   signature: string
@@ -579,7 +593,7 @@ New peer connects to network:
   command: 'catalog_sync_req',
   requestID: string,
   networkID: string,
-  vectorSummary: Record<string, number>,  // peerID -> lamport clock
+  vectorSummary: Record<string, HLC>,     // peerID -> highest HLC seen
   lishIDs: string[]                        // all lish UUIDs I know
 }
 ```
@@ -592,7 +606,7 @@ New peer connects to network:
   entries: CatalogEntry[],        // entries you don't have
   tombstones: TombstoneEntry[],   // deletions you don't have
   access: ICatalogAccess,         // current ACL state
-  vectorSummary: Record<string, number>
+  vectorSummary: Record<string, HLC>
 }
 ```
 
@@ -704,7 +718,10 @@ Catalog file structure:
     "12D3KooWJdc...": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
     "12D3KooWAbc...": { "wallTime": 1709164700000, "logical": 2, "nodeID": "12D3KooWAbc..." }
   },
-  "localClock": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." }
+  "localClock": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
+  "syncState": {
+    "12D3KooWAbc...": { "wallTime": 1709164650000, "logical": 0, "nodeID": "12D3KooWJdc..." }
+  }
 }
 ```
 
@@ -773,9 +790,11 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 
 ### Phase 4: Hardening
 - Cross-peer validation on sync (compare with multiple peers)
-- Tombstone garbage collection
+- Tombstone garbage collection (time-based, 30 days)
 - Rate limiting on incoming operations
 - Catalog size limits per network
+- Merkle Search Tree anti-entropy (for catalogs > 10K entries)
+- Content availability verification (random chunk challenge)
 - Metrics and monitoring
 
 ---
@@ -803,7 +822,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] vectorClock (HLC map) persisted to disk and reloaded on restart (prevents replay after restart)
 - [ ] GossipSub topic validator registered for catalog topics (REJECT invalid sigs, IGNORE rate-limited)
 - [ ] Content availability verification via random chunk challenge (optional, Phase 4)
-- [ ] Emergency revocation: manage_members remove propagates within 1 heartbeat cycle
+- [ ] Emergency revocation: acl_revoke propagates within 1 heartbeat cycle
 - [ ] Anti-escalation rule: cannot grant permissions you do not hold (Matrix Rule 9)
 - [ ] Power-events-first ordering: ACL events processed before catalog events in same batch
 - [ ] Cascading revocation: revoking admin invalidates all their granted moderator permissions
@@ -934,7 +953,7 @@ interface DelegationToken {
 | System | What libershare gets right | Source |
 |---|---|---|
 | **All 7 systems** | Two-layer sync (gossipsub + bilateral) | SSB, Matrix, Nostr, Tribler all use this pattern |
-| **BEP-44, SSB** | Lamport clocks for replay prevention | BEP44 sequence numbers, SSB feed sequences |
+| **BEP-44, SSB** | Per-author monotonic clocks for replay prevention (HLC in our case) | BEP44 sequence numbers, SSB feed sequences |
 | **All systems** | Owner PeerID from .lishnet (out-of-band trust) | Matrix room creator, SSB genesis, BT tracker URL |
 | **go-ds-crdt** | Signed 2P-Set CRDT | IPFS Cluster production: 80M pins, 24 peers |
 | **Nostr NIP-01** | Signed events with canonical JSON | Every Nostr event is self-authenticating |
@@ -949,7 +968,7 @@ interface DelegationToken {
 | **Gossipsub D=2** | Below spec minimum D=6, single bad peer can partition mesh | Ethereum beacon chain uses D=8 |
 | **No peer scoring** | Flooding invalid messages has zero consequence | gossipsub v1.1 P4+P5+P6 |
 | **Open-mode spam** | Networks with restrictCatalogWrites=false have no spam protection | Nostr open relay experience |
-| **Missing CatalogEntry fields** | Need contentType + tags for search/filter | Nostr NIP-94, Tribler channels |
+| ~~Missing CatalogEntry fields~~ | **Fixed** — contentType, tags, manifestHash added to CatalogEntry | Nostr NIP-94, Tribler channels |
 
 ### Architecture Patterns Adopted
 
