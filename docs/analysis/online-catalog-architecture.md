@@ -165,11 +165,15 @@ interface CatalogCRDTState {
   networkID: string;
   entries: Map<string, CatalogEntry>;
   tombstones: Map<string, TombstoneEntry>;
+  opLog: Map<string, SignedCatalogOp>;  // lishID -> last SignedCatalogOp (for bilateral sync verification)
   access: ICatalogAccess;
   vectorClock: Map<string, HLC>;     // peerID -> highest HLC seen from that peer
   localClock: HLC;                   // this peer's current HLC
   syncState: Map<string, HLC>;      // peerID -> last HLC synced with that peer (for delta sync)
 }
+// opLog stores the most recent SignedCatalogOp for each entry/tombstone.
+// This enables bilateral sync peers to verify signatures — the full
+// CatalogOpPayload (including nonce) is preserved, not just the derived CatalogEntry.
 ```
 
 ---
@@ -259,6 +263,8 @@ Every peer can verify the full chain:
 4. Catalog write is signed by author → verify author has write permission
 
 #### 4.4 Operation Validation Rules
+
+**Note**: This section uses the conceptual `SignedOperation` interface for readability. The canonical implementation uses `SignedCatalogOp` field names — see section 16.4 for the canonical `validateOperation()` with `op.signer`, `op.payload.type`, `op.payload.hlc`, and `op.payload.networkID` checks.
 
 Every received operation goes through validation before being applied:
 
@@ -646,12 +652,14 @@ New peer connects to network:
 {
   command: 'catalog_sync_res',
   requestID: string,
-  entries: CatalogEntry[],        // entries you don't have
-  tombstones: TombstoneEntry[],   // deletions you don't have
-  access: ICatalogAccess,         // current ACL state
-  vectorSummary: Record<string, HLC>
+  operations: SignedCatalogOp[],   // verifiable signed ops for entries + tombstones you don't have
+  access: ICatalogAccess,          // current ACL state
+  vectorSummary: Record<string, HLC>,
+  gcCutoff: number                 // epoch ms — tombstones before this were garbage collected (§17.2)
 }
 ```
+
+**Why `SignedCatalogOp[]` instead of `CatalogEntry[]`**: The signature in `SignedCatalogOp` covers the full `CatalogOpPayload` (including `nonce`, `networkID`, `hlc`). A bare `CatalogEntry` does not preserve the original payload — the `nonce` is lost, making signature verification impossible. Sending full signed operations enables receiving peers to verify every entry through the same `verifyCatalogOp()` function used for GossipSub messages.
 
 ### Scale Limits
 
@@ -801,6 +809,7 @@ interface CatalogSnapshot {
   version: 1;                           // schema version for forward compatibility
   entries: CatalogEntry[];
   tombstones: TombstoneEntry[];
+  opLog: SignedCatalogOp[];             // last op per entry/tombstone (for bilateral sync verification)
   access: ICatalogAccess;
   vectorClock: Record<string, HLC>;
   localClock: HLC;
@@ -812,6 +821,7 @@ export async function saveCatalog(path: string, state: CatalogCRDTState): Promis
     version: 1,
     entries: [...state.entries.values()],
     tombstones: [...state.tombstones.values()],
+    opLog: [...state.opLog.values()],
     access: state.access,
     vectorClock: Object.fromEntries(state.vectorClock),
     localClock: state.localClock,
@@ -950,18 +960,20 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 ## 9. Implementation Phases
 
 ### Phase 1: Core CRDT + Persistence (Backend)
-- `CatalogCRDT` class (entries, tombstones, merge, LWW, operation queue)
+- `CatalogCRDT` class (entries, tombstones, opLog, merge, LWW, operation queue)
 - HLC implementation (tick, merge, compare)
 - Signature generation and verification (Ed25519 via `@libp2p/crypto`)
-- Crash-safe CBOR persistence (write-then-rename, debounced saves)
+- Crash-safe CBOR persistence (write-then-rename, debounced saves, opLog serialization)
 - `CatalogManager` class (multi-lishnet lifecycle, load/unload catalogs)
 - Add `ownerPeerID` field to `ILISHNetwork` shared type
-- Add `getPrivateKey()` and `registerStreamHandler()` to `Network` class
+- Add `getPrivateKey()`, `registerStreamHandler()`, and `dialProtocolByPeerId()` to `Network` class
+- Update `TopicHandler` type to `(data: Record<string, any>) => void | Promise<void>` (async support)
 - Unit tests for merge correctness, security validation, crash recovery
 
 ### Phase 2: Sync + GossipSub Integration (Backend)
-- Bilateral sync stream `/lish/catalog-sync/1.0.0` (CBOR, with error handling and timeouts)
+- Bilateral sync stream `/lish/catalog-sync/1.0.0` (CBOR, `SignedCatalogOp[]` for verifiability)
 - GossipSub broadcast for catalog operations (JSON, signed)
+- GossipSub topic validator via `registerTopicValidator()` on `Network` class (REJECT/IGNORE/Accept)
 - Handle incoming ops (validate signature + ACL + field sizes, merge)
 - ACL operations (add/remove admin/moderator, cascading revocation)
 - Integration with `Networks` class (join → catalog load, leave → catalog unload)
@@ -1633,7 +1645,7 @@ How `catalog.publish(networkID, lishID)` works from API call to broadcast. **Imp
 1. Frontend calls: catalog.publish(networkID, lishID)
 
 2. Backend resolves local LISH:
-   const lish = dataServer.get(lishID);
+   const lish = dataServer.get(lishID);  // returns LISHData | undefined — lishID is a plain string, not a branded type
    if (!lish) throw new Error('LISH not found locally');
 
 3. Backend extracts summary from LISH manifest:
@@ -1738,6 +1750,9 @@ export class CatalogManager {
 
     this.catalogs.set(networkID, crdt);
 
+    // Start periodic bilateral sync (anti-entropy) for this catalog
+    crdt.startAntiEntropy();
+
     // Register GossipSub handler for catalog_op messages on this network's topic.
     // Note: Networks.subscribeTopic() already subscribes to the gossipsub topic
     // and registers the `want` handler. This call only adds an additional handler
@@ -1758,6 +1773,7 @@ export class CatalogManager {
   async leave(networkID: string): Promise<void> {
     const crdt = this.catalogs.get(networkID);
     if (!crdt) return;
+    crdt.stopAntiEntropy();
     await crdt.flush();  // persist any pending changes
     this.catalogs.delete(networkID);
   }
@@ -2190,27 +2206,58 @@ class CatalogCRDT {
   private dirty: boolean = false;                   // pending unsaved changes
   private antiEntropyTimer: Timer | null = null;    // periodic sync timer
 
+  // Precondition: network.start() must have completed before constructing CatalogCRDT.
+  // getNodeInfo() returns null if the network is not started.
   constructor(networkID: string, ownerPeerID: string, network: Network, dataDir: string) {
     this.networkID = networkID;
     this.ownerPeerID = ownerPeerID;
     this.network = network;
     this.path = `${dataDir}/catalog/${networkID}.cbor`;
-    // Initialize empty state — overwritten by loadFromSnapshot() if file exists
+
+    const nodeInfo = network.getNodeInfo();
+    if (!nodeInfo) throw new Error('Network must be started before creating CatalogCRDT');
+
     this.state = {
       networkID,
       entries: new Map(),
       tombstones: new Map(),
+      opLog: new Map(),
       access: { owner: ownerPeerID, admins: [], moderators: [], restrictCatalogWrites: false },
       vectorClock: new Map(),
-      localClock: { wallTime: Date.now(), logical: 0, nodeID: network.getNodeInfo().peerID },
+      localClock: { wallTime: Date.now(), logical: 0, nodeID: nodeInfo.peerID },
       syncState: new Map(),
     };
   }
 
   // === Lifecycle ===
-  loadFromSnapshot(snapshot: CatalogSnapshot): void { /* restore state from CBOR */ }
+
+  /**
+   * Restore CRDT state from a persisted CBOR snapshot.
+   * CBOR's `mapsAsObjects: true` means Maps are decoded as plain objects — reconstruct them.
+   */
+  loadFromSnapshot(snapshot: CatalogSnapshot): void {
+    this.state.entries = new Map(snapshot.entries.map(e => [e.lishID, e]));
+    this.state.tombstones = new Map(snapshot.tombstones.map(t => [t.lishID, t]));
+    // opLog: keyed by the lishID from the operation's data payload
+    this.state.opLog = new Map(
+      snapshot.opLog.map(op => [(op.payload.data as any).lishID ?? op.payload.data.lishID, op])
+    );
+    this.state.access = snapshot.access;
+    this.state.vectorClock = new Map(Object.entries(snapshot.vectorClock));
+    this.state.localClock = snapshot.localClock;
+    this.state.syncState = new Map(Object.entries(snapshot.syncState));
+  }
+
   getState(): CatalogCRDTState { return this.state; }
-  async flush(): Promise<void> { /* §15.10: save immediately, clear timer */ }
+
+  async flush(): Promise<void> {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    if (this.dirty) {
+      await saveCatalog(this.path, this.state);
+      this.dirty = false;
+    }
+  }
 
   // === Query methods (called by API handlers) ===
   getEntry(lishID: string): CatalogEntry | undefined { return this.state.entries.get(lishID); }
@@ -2227,50 +2274,49 @@ class CatalogCRDT {
 
   // === Remote operation handling ===
   async handleRemoteOperation(msg: Record<string, any>): Promise<void> { /* §17.8 */ }
-  async handleSyncStream(stream: Stream, request: any): Promise<void> { /* respond to bilateral sync */ }
+  async handleSyncStream(stream: Stream, request: any): Promise<void> {
+    // Respond to bilateral sync: compute delta ops from opLog, encode as CBOR, send
+  }
 
   // === CRDT merge (core) ===
-  private applyDataOp(op: SignedCatalogOp): void { /* §18.2 */ }
+  private applyDataOp(op: SignedCatalogOp): void {
+    /* §18.2 — also stores op in opLog: this.state.opLog.set(lishID, op) */
+  }
   private applyACLOp(op: SignedCatalogOp): void { /* §18.2 */ }
 
   /**
-   * Merge a single CatalogEntry received via bilateral sync.
-   * Unlike handleRemoteOperation (which receives full SignedCatalogOp messages
-   * from GossipSub), bilateral sync delivers raw entries with embedded signatures.
-   * Each entry is re-validated before merge (the peer may be malicious).
+   * Merge a SignedCatalogOp received via bilateral sync.
+   * Full signature verification is possible because the original CatalogOpPayload
+   * (including nonce) is preserved in the SignedCatalogOp envelope.
    */
-  private mergeEntry(entry: CatalogEntry): void {
-    // Verify signature embedded in entry
-    // (reconstruct minimal SignedCatalogOp for verifyCatalogOp)
-    // Tombstone check: skip if tombstoned with higher HLC
-    const tombstone = this.state.tombstones.get(entry.lishID);
-    if (tombstone && hlcCompare(tombstone.hlc, entry.hlc) > 0) return;
-
-    // LWW merge: only replace if incoming HLC is higher
-    const existing = this.state.entries.get(entry.lishID);
-    if (!existing || hlcCompare(entry.hlc, existing.hlc) > 0) {
-      this.state.entries.set(entry.lishID, entry);
+  private mergeSyncOp(op: SignedCatalogOp): void {
+    // 1. Verify signature (uses verifyCatalogOp — full payload including nonce)
+    if (!verifyCatalogOp(op)) {
+      console.warn(`Bilateral sync: rejected op with invalid signature from ${op.signer}`);
+      return;
     }
 
-    // Update vector clock for entry's publisher
-    const lastSeen = this.state.vectorClock.get(entry.publisherPeerID);
-    if (!lastSeen || hlcCompare(entry.hlc, lastSeen) > 0) {
-      this.state.vectorClock.set(entry.publisherPeerID, entry.hlc);
-    }
-  }
+    // 2. Check networkID
+    if (op.payload.networkID !== this.networkID) return;
 
-  /**
-   * Merge a tombstone received via bilateral sync.
-   * Tombstone with higher HLC always wins (remove-wins semantics).
-   */
-  private mergeTombstone(tombstone: TombstoneEntry): void {
-    // Verify signature embedded in tombstone
-    const existing = this.state.tombstones.get(tombstone.lishID);
-    if (!existing || hlcCompare(tombstone.hlc, existing.hlc) > 0) {
-      this.state.tombstones.set(tombstone.lishID, tombstone);
+    // 3. HLC replay check
+    const lastSeen = this.state.vectorClock.get(op.signer);
+    if (lastSeen && hlcCompare(op.payload.hlc, lastSeen) <= 0) return;
+
+    // 4. Apply via normal CRDT merge (reuses applyDataOp/applyACLOp)
+    if (op.payload.type === 'acl_grant' || op.payload.type === 'acl_revoke') {
+      this.applyACLOp(op);
+    } else {
+      this.applyDataOp(op);
     }
-    // Remove from active entries if present
-    this.state.entries.delete(tombstone.lishID);
+
+    // 5. Update vector clock by signer (not publisherPeerID — signer is the author
+    //    of the current version, which may differ from original publisher after updates)
+    this.state.vectorClock.set(op.signer, op.payload.hlc);
+
+    // 6. Store in opLog for future sync forwarding
+    const lishID = (op.payload.data as any).lishID;
+    if (lishID) this.state.opLog.set(lishID, op);
   }
 
   // === Sync (bilateral) ===
@@ -2292,9 +2338,16 @@ class CatalogCRDT {
     await this.bilateralSync(peer);
   }
 
+  /**
+   * Initiate bilateral sync with a remote peer.
+   * Note: Network.dialProtocol() currently takes multiaddrs[], not peerID string.
+   * Requires adding a peerID-based overload that resolves multiaddrs from the peer store:
+   *   async dialProtocolByPeerId(peerID: string, protocol: string): Promise<Stream>
+   * Or resolve multiaddrs here: const peer = await this.network.node.peerStore.get(peerIdFromString(peerID));
+   */
   private async bilateralSync(peerID: string): Promise<void> {
     try {
-      const stream = await this.network.dialProtocol(peerID, '/lish/catalog-sync/1.0.0');
+      const stream = await this.network.dialProtocolByPeerId(peerID, '/lish/catalog-sync/1.0.0');
       const request = encoder.encode({
         command: 'catalog_sync_req',
         requestID: crypto.randomUUID(),
@@ -2302,7 +2355,7 @@ class CatalogCRDT {
         vectorSummary: Object.fromEntries(this.state.vectorClock),
         lishIDs: [...this.state.entries.keys()],
       });
-      stream.sink([request]);
+      await stream.sink([request]);
 
       let responseBytes = new Uint8Array();
       for await (const chunk of stream.source) {
@@ -2314,11 +2367,9 @@ class CatalogCRDT {
       }
 
       const response = decoder.decode(responseBytes);
-      for (const entry of response.entries ?? []) {
-        this.mergeEntry(entry);
-      }
-      for (const tombstone of response.tombstones ?? []) {
-        this.mergeTombstone(tombstone);
+      // Merge operations (each fully verifiable via SignedCatalogOp)
+      for (const op of response.operations ?? []) {
+        this.mergeSyncOp(op);
       }
       // Run tombstone GC after sync (§17.2)
       garbageCollectTombstones(this.state);
@@ -2624,7 +2675,8 @@ backend/src/
 │   ├── catalog.ts          (NEW: initCatalogHandlers — WebSocket API)
 │   └── server.ts           (EDIT: register catalog handlers, inject CatalogManager)
 ├── protocol/
-│   ├── network.ts          (EDIT: add getPrivateKey(), registerStreamHandler())
+│   ├── network.ts          (EDIT: add getPrivateKey(), registerStreamHandler(), dialProtocolByPeerId(),
+│   │                               registerTopicValidator(); update TopicHandler type to support async)
 │   └── network-config.ts   (EDIT: future — upgrade gossipsub D to >=6, add peer scoring)
 ├── lishnet/
 │   └── networks.ts         (EDIT: call catalogManager.join/leave on setEnabled)
@@ -2799,6 +2851,8 @@ registerTopicValidator(
   (this.node.services.pubsub as any).topicValidators.set(topic, validator);
 }
 ```
+
+**Fragility note**: `topicValidators` is accessed via `as any` cast because gossipsub does not expose it in its public TypeScript interface. This is a known gossipsub internals dependency. If the gossipsub library upgrades and renames the map, this will break silently. Mitigation: add a runtime check in `registerTopicValidator()` that throws if the map doesn't exist, and pin the `@chainsafe/libp2p-gossipsub` version in `package.json`.
 
 **Validator implementation**:
 
@@ -3128,7 +3182,7 @@ class CatalogCRDT {
 
 **Key semantics**:
 - **Add**: Insert if new or HLC is higher than existing. Skip if tombstoned.
-- **Update**: Whole-entry LWW — only apply if incoming HLC > existing HLC.
+- **Update**: Whole-entry LWW — only apply if incoming HLC > existing HLC. After an update, `entry.signature` is the signature of the update operation's `CatalogOpPayload`, not a signature covering the full entry state. Immutable fields (`publisherPeerID`, `totalSize`, `manifestHash`, etc.) are guaranteed by the original `add` op's signature preserved in `opLog`.
 - **Remove**: Always creates tombstone. Tombstone beats add if HLC is higher (remove-wins).
 - **ACL grant**: Append to role array (idempotent — deduplicated).
 - **ACL revoke**: Filter from role array. Cascading revocation for admin demotion.
