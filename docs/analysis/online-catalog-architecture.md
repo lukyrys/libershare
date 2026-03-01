@@ -1904,7 +1904,7 @@ async function handleCatalogSyncStream(stream: Stream): Promise<void> {
 
     // Write response (CBOR)
     const responseBytes = encoder.encode(response);
-    stream.sink([responseBytes]);
+    await stream.sink([responseBytes]);
 
   } catch (err) {
     // Stream error — logged, peer scored, no crash
