@@ -2,7 +2,7 @@
 
 **Date**: 2026-02-28 (updated 2026-02-28)
 **Branch**: `feat/online-db`
-**Status**: Design phase - Research iteration 5 (integration design, protocol mapping, crash safety, concurrency)
+**Status**: Design phase - Research iteration 6 (hardening: GC, rate limits, topic validators, error handling, upgrade path)
 **Author**: Analysis by Claude, discussed with Jiri Kreibich
 **Research sources**: libp2p source code, IPFS Cluster, go-ds-crdt, Nostr NIPs, Matrix, Farcaster, BitTorrent BEP-52, gossipsub v1.1 spec
 
@@ -1033,6 +1033,13 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Debounced persistence: max 1 disk write per 500ms, flush on shutdown
 - [ ] .lishnet `ownerPeerID` field: required for catalog, validated as Ed25519 PeerID
 - [ ] `manifestHash` computed as sha256(canonicalize(lishManifest)) — anchors catalog entry to exact manifest
+- [ ] `signCatalogOp()` receives `localClock` as parameter, returns `updatedClock` (no free variables)
+- [ ] Tombstone GC: 30-day retention, runs on anti-entropy cycle, `gcCutoff` in sync response
+- [ ] Rate limiter: 10 ops/peer/min, 100 ops/global/min, 1000 entries/publisher, 50K entries/catalog
+- [ ] GossipSub topic validator: REJECT invalid sigs, IGNORE rate-limited, Accept valid
+- [ ] Structured error codes (CatalogError class) — frontend can switch on `error.code`
+- [ ] Graceful degradation: catalog failures never block file sharing operations
+- [ ] v1 .lishnet upgrade: prompt-based ownerPeerID assignment with re-export
 
 ---
 
@@ -1081,12 +1088,14 @@ export async function signCatalogOp(
   privateKey: Ed25519PrivateKey,
   type: CatalogOpPayload['type'],
   networkID: string,
-  data: Record<string, unknown>
-): Promise<SignedCatalogOp> {
+  data: Record<string, unknown>,
+  localClock: HLC              // caller passes current clock (see section 17.1)
+): Promise<{ op: SignedCatalogOp; updatedClock: HLC }> {
+  const newClock = hlcTick(localClock);
   const payload: CatalogOpPayload = {
     type,
     networkID,
-    hlc: hlcTick(localClock),  // advance local HLC
+    hlc: newClock,
     nonce: crypto.randomUUID(),
     data,
   };
@@ -1094,10 +1103,13 @@ export async function signCatalogOp(
   const bytes = encoder.encode(canonical);
   const sig = await privateKey.sign(bytes);      // Ed25519 is sync, await is safe
   return {
-    payload,
-    signature: Buffer.from(sig).toString('base64url'),
-    signer: privateKey.publicKey.toString(),      // base58btc PeerID
-    keyType: 'Ed25519',
+    op: {
+      payload,
+      signature: Buffer.from(sig).toString('base64url'),
+      signer: privateKey.publicKey.toString(),      // base58btc PeerID
+      keyType: 'Ed25519',
+    },
+    updatedClock: newClock,
   };
 }
 
@@ -1636,13 +1648,15 @@ How `catalog.publish(networkID, lishID)` works from API call to broadcast:
      totalSize: lish.files.reduce((sum, f) => sum + f.size, 0),
      manifestHash: sha256(canonicalize(lish)),  // integrity anchor
      name: lish.name,                             // undefined if not set (UI shows lishID as fallback)
-     hlc: hlcTick(localClock),
-     signature: '',  // filled below
+     // hlc and signature are added by signCatalogOp()
    };
 
-4. Backend signs the entry:
+4. Backend signs the entry (clock passed in, updated clock returned):
    const privateKey = network.getPrivateKey();
-   const signedOp = await signCatalogOp(privateKey, 'add', networkID, entry);
+   const { op: signedOp, updatedClock } = await signCatalogOp(
+     privateKey, 'add', networkID, entry, catalogCRDT.state.localClock
+   );
+   catalogCRDT.state.localClock = updatedClock;
 
 5. Backend applies locally:
    catalogCRDT.applyOperation(signedOp);  // validates + merges into local state
@@ -2545,3 +2559,326 @@ frontend/src/
 
 **Total new files**: 9 backend + 1 shared + 1 frontend script = 11 new files
 **Total edited files**: 6 (server.ts, network.ts, networks.ts, app.ts, Products.svelte, ProductsItem.svelte, shared/index.ts)
+
+---
+
+## 17. Open Design Questions — Hardening & Operational Concerns (Resolved)
+
+Analysis of security checklist items, implementation phases, and cross-section consistency reveals these remaining gaps that must be resolved before Phase 1 is complete.
+
+### 17.1 signCatalogOp: localClock as Free Variable
+
+Section 11's `signCatalogOp()` references `localClock` as a free variable (line 1089). This clock lives inside `CatalogCRDTState.localClock`, owned by the `CatalogCRDT` instance. The signing function cannot access it.
+
+**Decision: Pass localClock as parameter, return updated clock.**
+
+```typescript
+// Updated signCatalogOp signature
+export async function signCatalogOp(
+  privateKey: Ed25519PrivateKey,
+  type: CatalogOpPayload['type'],
+  networkID: string,
+  data: Record<string, unknown>,
+  localClock: HLC                  // caller passes current clock
+): Promise<{ op: SignedCatalogOp; updatedClock: HLC }> {
+  const newClock = hlcTick(localClock);
+  const payload: CatalogOpPayload = {
+    type,
+    networkID,
+    hlc: newClock,
+    nonce: crypto.randomUUID(),
+    data,
+  };
+  const canonical = canonicalize(payload);
+  const bytes = encoder.encode(canonical);
+  const sig = await privateKey.sign(bytes);
+  return {
+    op: {
+      payload,
+      signature: Buffer.from(sig).toString('base64url'),
+      signer: privateKey.publicKey.toString(),
+      keyType: 'Ed25519',
+    },
+    updatedClock: newClock,
+  };
+}
+```
+
+**Caller** (inside `CatalogCRDT.publish()`):
+
+```typescript
+const { op, updatedClock } = await signCatalogOp(
+  this.network.getPrivateKey(), 'add', this.networkID, entryData, this.state.localClock
+);
+this.state.localClock = updatedClock;
+```
+
+This ensures HLC monotonicity — the clock advances on every local operation and never goes backward.
+
+### 17.2 Tombstone Garbage Collection
+
+The security checklist requires "tombstones kept for minimum 30 days (time-based GC)". Without GC, tombstones accumulate indefinitely and waste storage + bandwidth.
+
+**Decision: Time-based GC with safety window.**
+
+```typescript
+const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;  // 30 days
+
+function garbageCollectTombstones(state: CatalogCRDTState): number {
+  const cutoff = Date.now() - TOMBSTONE_RETENTION_MS;
+  let removed = 0;
+
+  for (const [lishID, tombstone] of state.tombstones) {
+    const removedAt = new Date(tombstone.removedAt).getTime();
+    if (removedAt < cutoff) {
+      state.tombstones.delete(lishID);
+      removed++;
+    }
+  }
+  return removed;
+}
+```
+
+**When to run**: On every anti-entropy cycle (every 60s), after successful bilateral sync. Not on every GossipSub message — GC is not urgent.
+
+**Risk: zombie re-add.** If a peer was offline for 31 days, they may not have seen a tombstone that was already GC'd. When they come back, they re-add the deleted entry. This is a known limitation of time-based tombstone GC.
+
+**Mitigation**: On bilateral sync, the responding peer sends a `gcCutoff` timestamp. If the requesting peer has entries older than `gcCutoff` that are not in the responder's catalog, the requester should treat them as potentially deleted and flag them for manual review (not auto-remove — to avoid data loss from a malicious responder).
+
+```typescript
+// Bilateral sync response includes gcCutoff
+interface CatalogSyncResponse {
+  // ... existing fields ...
+  gcCutoff: number;  // epoch ms — tombstones before this were garbage collected
+}
+```
+
+### 17.3 Rate Limiting on Incoming Operations
+
+The security checklist requires "sliding-window rate limiter per publisher PeerID". Without it, a rogue moderator can flood the catalog.
+
+**Decision: Per-peer sliding window + global budget.**
+
+```typescript
+const RATE_LIMITS = {
+  maxOpsPerPeerPerMinute: 10,    // max 10 operations per peer per 60s window
+  maxOpsGlobalPerMinute: 100,    // max 100 operations across all peers per 60s
+  maxEntriesPerPublisher: 1000,  // max entries a single publisher can have in catalog
+  maxCatalogSize: 50_000,        // max total entries per network catalog
+} as const;
+
+class RateLimiter {
+  private windows: Map<string, number[]> = new Map();  // peerID → timestamp[]
+  private globalWindow: number[] = [];
+
+  check(peerID: string): 'allow' | 'reject' {
+    const now = Date.now();
+    const cutoff = now - 60_000;
+
+    // Per-peer check
+    const peerOps = (this.windows.get(peerID) ?? []).filter(t => t > cutoff);
+    if (peerOps.length >= RATE_LIMITS.maxOpsPerPeerPerMinute) return 'reject';
+
+    // Global check
+    this.globalWindow = this.globalWindow.filter(t => t > cutoff);
+    if (this.globalWindow.length >= RATE_LIMITS.maxOpsGlobalPerMinute) return 'reject';
+
+    // Record
+    peerOps.push(now);
+    this.windows.set(peerID, peerOps);
+    this.globalWindow.push(now);
+    return 'allow';
+  }
+}
+```
+
+**Integration with GossipSub topic validator** (section 17.4): Rate-limited operations return `IGNORE` (not `REJECT`), because the sender may be legitimately busy — penalizing them with a `REJECT` score would be too harsh.
+
+**Integration with catalog size limits**: Before applying an `add` operation, check:
+1. `entries.size < RATE_LIMITS.maxCatalogSize` (global cap)
+2. Count of entries where `entry.publisherPeerID === op.signer` < `maxEntriesPerPublisher`
+
+### 17.4 GossipSub Topic Validator
+
+The security checklist requires "topic validator registered for catalog topics". GossipSub validators run before message delivery and can score peers.
+
+**Decision: Register a topic validator that validates signatures and rate limits.**
+
+```typescript
+// Registered once per network topic in CatalogManager.join()
+pubsub.topicValidators.set(lishTopic(networkID), async (peerID, msg) => {
+  try {
+    const data = JSON.parse(new TextDecoder().decode(msg.data));
+    if (data.type !== 'catalog_op') return TopicValidatorResult.Accept;  // not a catalog message
+
+    // Parse as SignedCatalogOp
+    const op = data as SignedCatalogOp;
+
+    // 1. Field size limits (cheap — fail fast before signature verification)
+    if (!validateFieldSizes(op.payload.data as CatalogEntry)) {
+      return TopicValidatorResult.Reject;  // definite spam → penalize sender
+    }
+
+    // 2. Signature verification
+    if (!await verifyCatalogOp(op)) {
+      return TopicValidatorResult.Reject;  // invalid signature → definite bad actor
+    }
+
+    // 3. Rate limit check
+    if (rateLimiter.check(op.signer) === 'reject') {
+      return TopicValidatorResult.Ignore;  // rate limited → don't penalize, just skip
+    }
+
+    return TopicValidatorResult.Accept;
+  } catch {
+    return TopicValidatorResult.Ignore;  // parse error — could be old format, don't penalize
+  }
+});
+```
+
+**Return values**:
+- `Accept`: Message delivered to handlers
+- `Reject`: Message dropped, peer's P4 score decremented (invalid messages penalty)
+- `Ignore`: Message dropped silently, no score impact
+
+**Note**: The topic validator runs on the GossipSub layer (before message reaches `topicHandlers`). This means signature verification happens twice — once in the validator (for scoring) and once in `validateOperation()` (for CRDT merge). In practice, the validator result is cached, so the second check can be skipped. Implementation detail for Phase 2.
+
+### 17.5 v1 .lishnet Upgrade Path
+
+Existing networks have `.lishnet` files without `ownerPeerID`. Section 15.3 makes this field optional for backward compatibility, but doesn't describe the upgrade flow.
+
+**Decision: Prompt-based upgrade + network re-export.**
+
+```
+Scenario: User has v1 .lishnet files (no ownerPeerID)
+
+1. User opens LiberShare v2 (with catalog support)
+2. Backend loads lishnets.json — detects entries without ownerPeerID
+3. For each network where local peer is the creator:
+   - UI shows notification: "Network X can be upgraded to support catalogs"
+   - User confirms → backend sets ownerPeerID to local PeerID
+   - Backend exports updated .lishnet file for redistribution
+4. For networks where local peer is NOT the creator:
+   - UI shows: "Waiting for network owner to upgrade"
+   - Catalog features are disabled for this network
+   - File sharing continues to work (catalog is optional)
+5. When user imports an updated .lishnet (with ownerPeerID):
+   - Backend merges: updates ownerPeerID, keeps local enabled/disabled state
+   - Catalog features become available
+```
+
+**Key constraint**: Only the original creator should set `ownerPeerID`. We cannot know who the creator is from a v1 file. The upgrade prompt appears for all members, but only the actual creator should confirm. This is a trust decision — the first person to claim ownership gets it. After that, the signed `.lishnet` with `ownerPeerID` is redistributed, and other members import it.
+
+**Edge case**: Two members both claim ownership before redistributing. Whoever's `.lishnet` file gets imported by more members wins — there's no consensus mechanism. This is intentional: `.lishnet` files are distributed out-of-band, and the creator is assumed to be the one sharing them.
+
+### 17.6 Error Response Format
+
+API handlers throw generic `Error` objects. The frontend needs structured error codes to show appropriate UI.
+
+**Decision: Standardized error codes for catalog operations.**
+
+```typescript
+// Catalog-specific error codes (returned in WebSocket { id, error } responses)
+const CATALOG_ERRORS = {
+  // Client errors (user can fix)
+  CATALOG_NOT_AVAILABLE: 'Catalog not available for this network (missing ownerPeerID or not joined)',
+  LISH_NOT_FOUND: 'LISH not found locally — import it first',
+  LISH_NO_FILES: 'LISH has no files — cannot publish empty LISH',
+  ENTRY_NOT_FOUND: 'Catalog entry not found',
+  UNAUTHORIZED: 'Insufficient permissions for this operation',
+  INVALID_FIELDS: 'Invalid update fields — only name, description, contentType, tags allowed',
+  FIELD_TOO_LARGE: 'Field exceeds size limit',
+  RATE_LIMITED: 'Too many operations — try again later',
+  CATALOG_FULL: 'Catalog has reached maximum size',
+
+  // System errors (user cannot fix)
+  NETWORK_NOT_RUNNING: 'Network is not running',
+  SIGNING_FAILED: 'Failed to sign operation',
+  SYNC_FAILED: 'Bilateral sync failed',
+} as const;
+
+type CatalogErrorCode = keyof typeof CATALOG_ERRORS;
+```
+
+**Integration**: API handlers throw `CatalogError(code)` instead of generic `Error`. The WebSocket error response includes `{ id, error: { code, message } }`:
+
+```typescript
+class CatalogError extends Error {
+  constructor(public readonly code: CatalogErrorCode) {
+    super(CATALOG_ERRORS[code]);
+  }
+}
+
+// In API handler:
+if (!lish) throw new CatalogError('LISH_NOT_FOUND');
+```
+
+**Frontend**: Switches on `error.code` to show appropriate UI (toast, dialog, disabled button, etc.).
+
+### 17.7 Graceful Degradation
+
+What happens when the catalog system fails? File sharing must continue.
+
+**Decision: Catalog is optional — failures are isolated.**
+
+```
+Failure scenario                       Impact                          Recovery
+───────────────────────────────────────────────────────────────────────────────
+Catalog CBOR file corrupt              Catalog resets to empty          Bilateral sync restores from peers
+signCatalogOp() throws                 Single publish/update fails      Retry via UI; error shown to user
+Bilateral sync timeout                 No catch-up for this cycle       Next anti-entropy cycle (60s)
+GossipSub message lost                 Single op missed                 Anti-entropy detects + fills gap
+All peers offline                      Cannot sync; local state stale   Works offline with local cache
+CatalogManager crash                   All catalog ops fail             App.ts catches, logs error, continues
+                                                                        File sharing (get_lish, get_chunk) unaffected
+Network.getPrivateKey() throws         Cannot sign any ops              Cannot publish; can still browse local cache
+CBOR decode error on sync              Delta rejected for this peer     Try different peer on next cycle
+```
+
+**Design principle**: The catalog system NEVER blocks or crashes the main application. `CatalogManager` methods are wrapped in try/catch at the API handler level. If catalog features are broken, the UI shows "Catalog unavailable" and the user can still:
+- Browse locally imported LISHs
+- Download files via direct `get_lish_req`/`get_chunk_req`
+- Manage network connections
+- Import/export `.lishnet` files
+
+### 17.8 handleRemoteOperation: Complete Method
+
+Section 15.6 references `crdt.handleRemoteOperation(msg)` and the code review identified that `scheduleSave()` must be called internally. Here's the complete method:
+
+```typescript
+class CatalogCRDT {
+  /**
+   * Handle an incoming GossipSub catalog_op message.
+   * Validates the operation, merges into local state, and schedules persistence.
+   */
+  async handleRemoteOperation(msg: Record<string, any>): Promise<void> {
+    await this.enqueueOperation(async () => {
+      const op = msg as SignedCatalogOp;
+
+      // Validate: signature, ACL, networkID, HLC replay
+      const result = validateOperation(op, this.state.access, this.networkID, this.state.vectorClock);
+      if (!result.valid) {
+        console.log(`Rejected catalog op from ${op.signer}: ${result.reason}`);
+        return;
+      }
+
+      // Power-events-first: ACL ops applied immediately
+      if (op.payload.type === 'acl_grant' || op.payload.type === 'acl_revoke') {
+        this.applyACLOp(op);
+      } else {
+        this.applyDataOp(op);
+      }
+
+      // Update vector clock
+      const mergedClock = hlcMerge(this.state.localClock, op.payload.hlc);
+      this.state.localClock = mergedClock;
+      this.state.vectorClock.set(op.signer, op.payload.hlc);
+
+      // Schedule debounced persistence
+      this.scheduleSave();
+    });
+  }
+}
+```
+
+This resolves the C1 finding (scheduleSave is now called internally, not from CatalogManager).
