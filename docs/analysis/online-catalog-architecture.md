@@ -1055,7 +1055,7 @@ bun add uint8arrays          # Uint8Array utilities (concat for stream reading) 
 The Ed25519 implementation in `@libp2p/crypto` uses **Node.js built-in `crypto`** (not WASM, not noble-ed25519). `sign()` and `verify()` are **synchronous** for Ed25519 (Promise return type exists only for RSA). Performance: ~10,000-15,000 sign/s, ~4,000-6,000 verify/s.
 
 ```typescript
-// backend/src/protocol/catalog-signer.ts
+// backend/src/catalog/catalog-signer.ts
 import { canonicalize } from 'json-canonicalize';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { Ed25519PrivateKey } from '@libp2p/interface';
@@ -1725,11 +1725,14 @@ export class CatalogManager {
 
     this.catalogs.set(networkID, crdt);
 
-    // Register GossipSub handler for catalog_op messages on this network's topic
+    // Register GossipSub handler for catalog_op messages on this network's topic.
+    // Note: Networks.subscribeTopic() already subscribes to the gossipsub topic
+    // and registers the `want` handler. This call only adds an additional handler
+    // for catalog_op messages — the double pubsub.subscribe() inside is idempotent.
     await this.network.subscribe(lishTopic(networkID), (msg) => {
       if (msg.type === 'catalog_op') {
         crdt.handleRemoteOperation(msg);
-        crdt.scheduleSave();  // debounced persistence
+        // scheduleSave() is called internally by handleRemoteOperation()
       }
     });
   }
@@ -2031,7 +2034,19 @@ interface IFileEntry {
 **Mapping to CatalogEntry**:
 
 ```typescript
-function lishToCatalogEntry(lish: IStoredLISH, publisherPeerID: string): Omit<CatalogEntry, 'hlc' | 'signature'> {
+// IStoredLISH extends ILISH with storage-specific fields (directory?, chunks?).
+// See shared/src/lish.ts for full definition.
+
+interface PublishOptions {
+  contentType?: CatalogEntry['contentType'];
+  tags?: string[];
+}
+
+function lishToCatalogEntry(
+  lish: IStoredLISH,
+  publisherPeerID: string,
+  opts?: PublishOptions
+): Omit<CatalogEntry, 'hlc' | 'signature'> {
   const files = lish.files ?? [];
   return {
     // Immutable identity fields
@@ -2044,9 +2059,11 @@ function lishToCatalogEntry(lish: IStoredLISH, publisherPeerID: string): Omit<Ca
     totalSize: files.reduce((sum, f) => sum + f.size, 0),
     manifestHash: sha256(canonicalize(lish)),
 
-    // Editable metadata (copied from LISH, can be edited later by any moderator)
+    // Editable metadata — set at publish time, can be edited later by any moderator
     name: lish.name,           // undefined if not set — UI shows lishID as fallback
     description: lish.description,
+    contentType: opts?.contentType,  // set by publisher in UI
+    tags: opts?.tags,                // set by publisher in UI
   };
 }
 ```
@@ -2109,6 +2126,8 @@ function paginatedList(
 }
 ```
 
+**Performance note**: The current implementation sorts all entries on every `list()` call — O(n log n). For Phase 1 (<10K entries, <15 ms sort), this is acceptable. If pagination becomes a bottleneck, cache the sorted array and invalidate only when entries are mutated (add/update/remove).
+
 **Frontend**: Products page loads first 100 entries, then loads more on scroll (infinite scroll pattern matching the existing grid layout).
 
 ### 16.3 Sync Triggers — When Does Bilateral Sync Fire?
@@ -2143,7 +2162,16 @@ The document describes bilateral sync but never specifies **when** it runs.
 
 ```typescript
 class CatalogCRDT {
+  readonly networkID: string;
+  private readonly ownerPeerID: string;
+  private readonly network: Network;
   private antiEntropyTimer: Timer | null = null;
+
+  constructor(networkID: string, ownerPeerID: string, network: Network) {
+    this.networkID = networkID;
+    this.ownerPeerID = ownerPeerID;
+    this.network = network;
+  }
 
   startAntiEntropy(): void {
     this.antiEntropyTimer = setInterval(() => {
@@ -2164,6 +2192,48 @@ class CatalogCRDT {
     const peer = peers[Math.floor(Math.random() * peers.length)]!;
     await this.bilateralSync(peer);
   }
+
+  /**
+   * Initiate bilateral sync with a remote peer.
+   * Opens a /lish/catalog-sync/1.0.0 stream and exchanges deltas.
+   */
+  private async bilateralSync(peerID: string): Promise<void> {
+    try {
+      const stream = await this.network.dialProtocol(peerID, '/lish/catalog-sync/1.0.0');
+      // Send our vector summary and known lishIDs
+      const request = encoder.encode({
+        command: 'catalog_sync_req',
+        requestID: crypto.randomUUID(),
+        networkID: this.networkID,
+        vectorSummary: Object.fromEntries(this.state.vectorClock),
+        lishIDs: [...this.state.entries.keys()],
+      });
+      stream.sink([request]);
+
+      // Read response (CBOR delta)
+      let responseBytes = new Uint8Array();
+      for await (const chunk of stream.source) {
+        responseBytes = concat([responseBytes, chunk.subarray()]);
+        if (responseBytes.byteLength > MAX_SYNC_PAYLOAD) {
+          stream.abort(new Error('payload too large'));
+          return;
+        }
+      }
+
+      const response = decoder.decode(responseBytes);
+      // Merge delta entries (each validated before merge)
+      for (const entry of response.entries ?? []) {
+        this.mergeEntry(entry);
+      }
+      for (const tombstone of response.tombstones ?? []) {
+        this.mergeTombstone(tombstone);
+      }
+      this.scheduleSave();
+    } catch (err) {
+      console.error(`Bilateral sync with ${peerID} failed:`, err);
+      // Will retry on next anti-entropy cycle
+    }
+  }
 }
 ```
 
@@ -2174,15 +2244,36 @@ A valid signed operation from network A could be replayed on network B. The `Sig
 **Decision: Add networkID check to validation.**
 
 ```typescript
-// Addition to validateOperation() in section 4.4
-function validateOperation(op: SignedCatalogOp, currentACL: ICatalogAccess, expectedNetworkID: string): ValidationResult {
+// Updated validateOperation() — canonical version using SignedCatalogOp fields.
+// Section 4.4 shows the conceptual model with SignedOperation fields (op.authorPeerID, op.op).
+// During implementation, map: op.signer → authorPeerID, op.payload.type → op type,
+// op.payload.hlc → HLC, op.payload.data → entry/tombstone/ACLChange.
+function validateOperation(
+  op: SignedCatalogOp,
+  currentACL: ICatalogAccess,
+  expectedNetworkID: string,
+  vectorClock: Map<string, HLC>
+): ValidationResult {
   // 0. Check networkID matches (cross-network replay prevention)
   if (op.payload.networkID !== expectedNetworkID) {
     return { valid: false, reason: 'NETWORK_ID_MISMATCH' };
   }
 
-  // 1. Verify Ed25519 signature (existing)
-  // ...
+  // 1. Verify Ed25519 signature
+  if (!verifyCatalogOp(op)) {
+    return { valid: false, reason: 'INVALID_SIGNATURE' };
+  }
+
+  // 2. Check authorization (using op.signer as authorPeerID, op.payload.type as op type)
+  // ... (see section 4.4 for full authorization logic)
+
+  // 3. HLC anti-replay check
+  const lastSeen = vectorClock.get(op.signer);
+  if (lastSeen && hlcCompare(op.payload.hlc, lastSeen) <= 0) {
+    return { valid: false, reason: 'REPLAY_DETECTED' };
+  }
+
+  return { valid: true };
 }
 ```
 
@@ -2263,8 +2354,9 @@ The API server uses a handler init pattern. The catalog needs a new handler file
 // backend/src/api/catalog.ts
 
 import { type CatalogManager } from '../catalog/catalog-manager.ts';
-import { type Networks } from '../lishnet/networks.ts';
+import { type CatalogCRDT } from '../catalog/catalog-crdt.ts';
 import { type DataServer } from '../lish/data-server.ts';
+import type { CatalogEntry, ICatalogAccess, CatalogSyncStatus, CatalogListResult } from '@shared';
 import { Utils } from '../utils.ts';
 const assert = Utils.assertParams;
 
@@ -2272,7 +2364,7 @@ interface CatalogHandlers {
   list: (p: { networkID: string; limit?: number; cursor?: string; sort?: string }) => CatalogListResult;
   get: (p: { networkID: string; lishID: string }) => CatalogEntry | null;
   search: (p: { networkID: string; query: string }) => CatalogEntry[];
-  publish: (p: { networkID: string; lishID: string }) => Promise<void>;
+  publish: (p: { networkID: string; lishID: string; contentType?: string; tags?: string[] }) => Promise<void>;
   update: (p: { networkID: string; lishID: string; fields: Record<string, any> }) => Promise<void>;
   remove: (p: { networkID: string; lishID: string }) => Promise<void>;
   getAccess: (p: { networkID: string }) => ICatalogAccess;
@@ -2282,7 +2374,6 @@ interface CatalogHandlers {
 
 export function initCatalogHandlers(
   catalogManager: CatalogManager,
-  networks: Networks,
   dataServer: DataServer
 ): CatalogHandlers {
   function getCatalog(networkID: string): CatalogCRDT {
@@ -2313,7 +2404,10 @@ export function initCatalogHandlers(
       const lish = dataServer.get(p.lishID);
       if (!lish) throw new Error('LISH not found locally');
       if (!lish.files?.length) throw new Error('LISH has no files');
-      await getCatalog(p.networkID).publish(lish);
+      await getCatalog(p.networkID).publish(lish, {
+        contentType: p.contentType,
+        tags: p.tags,
+      });
     },
     async update(p) {
       assert(p, ['networkID', 'lishID', 'fields']);
@@ -2342,7 +2436,7 @@ export function initCatalogHandlers(
 **Registration in `server.ts`** (following existing pattern):
 
 ```typescript
-const _catalog = initCatalogHandlers(catalogManager, this.networks, this.dataServer);
+const _catalog = initCatalogHandlers(catalogManager, this.dataServer);
 
 this.handlers = {
   // ... existing handlers ...
@@ -2407,7 +2501,7 @@ On select: Product component receives CatalogEntry
 - "Download" button → triggers transfer.download(networkID, lishID)
 - "Edit" button (if moderator+) → opens metadata edit form
 - "Remove" button (if moderator+) → confirms and calls catalog.remove
-- Fetch full LISH manifest on demand for file listing: api.lishs.get(lishID)
+- Fetch full LISH manifest on demand for file listing via existing get_lish_req/res protocol
 ```
 
 ### 16.8 File Structure — Planned Backend Modules
