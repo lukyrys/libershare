@@ -2,7 +2,7 @@
 
 **Date**: 2026-02-28 (updated 2026-02-28)
 **Branch**: `feat/online-db`
-**Status**: Design phase - Research iteration 3 (HLC, delta-state CRDT, MST anti-entropy)
+**Status**: Design phase - Research iteration 4 (open questions resolved, CBOR persistence, wire format, versioning)
 **Author**: Analysis by Claude, discussed with Jiri Kreibich
 **Research sources**: libp2p source code, IPFS Cluster, go-ds-crdt, Nostr NIPs, Matrix, Farcaster, BitTorrent BEP-52, gossipsub v1.1 spec
 
@@ -796,6 +796,7 @@ const encoder = new Encoder({ mapsAsObjects: true, useRecords: false });
 const decoder = new Decoder({ mapsAsObjects: true });
 
 interface CatalogSnapshot {
+  version: 1;                           // schema version for forward compatibility
   entries: CatalogEntry[];
   tombstones: TombstoneEntry[];
   access: ICatalogAccess;
@@ -991,6 +992,9 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Update operations: only editable fields (name, description, contentType, tags) can be changed
 - [ ] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
 - [ ] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
+- [ ] Field size limits enforced before signature verification (fail fast)
+- [ ] Schema version included in CBOR snapshot and sync protocol
+- [ ] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
 
 ---
 
@@ -1190,3 +1194,155 @@ interface DelegationToken {
 - gossipsub v1.1 paper (Protocol Labs): IP colocation penalty specifically designed for cheapest Sybil attack class
 - Cambridge paper on PoW: "Proof-of-Work Proves Not to Work" against well-resourced attackers
 - TrustChain (TU Delft): Personal blockchains without global consensus, fraud detected not prevented
+
+---
+
+## 14. Open Design Questions (Resolved)
+
+### 14.1 Catalog Bootstrap — How Does a New Network Start?
+
+When a user creates a new lishnet, the `.lishnet` file contains the owner's PeerID. The catalog is initialized automatically:
+
+```
+1. User creates new lishnet (or imports .lishnet file)
+2. Backend detects no catalog/<networkID>.cbor file exists
+3. Creates empty CatalogCRDTState:
+   - entries: empty
+   - tombstones: empty
+   - access: { owner: <PeerID from .lishnet>, admins: [], moderators: [],
+               restrictCatalogWrites: false }
+   - vectorClock: empty
+   - localClock: HLC(Date.now(), 0, localPeerID)
+   - syncState: empty
+4. If joining existing network: bilateral sync fills the catalog from peers
+5. If creating new network: owner starts with empty catalog, adds entries
+```
+
+The owner PeerID comes **exclusively** from the `.lishnet` config file — never from the network. This is the root of trust. The `.lishnet` file is distributed out-of-band (URL, QR code, file share, etc.).
+
+### 14.2 Owner Offline / Key Loss — Recovery Scenarios
+
+| Scenario | Impact | Recovery |
+|---|---|---|
+| Owner temporarily offline | Admins can still add moderators. Catalog works normally. | Owner comes back online eventually |
+| Owner lost private key | Cannot add new admins. Existing admins/moderators still function. | **No recovery** — network continues with existing ACL frozen |
+| Owner wants to transfer ownership | Not currently possible — owner is immutable in .lishnet | Create new .lishnet with new owner, migrate members manually |
+
+**Design decision**: Owner immutability is intentional. It prevents a hostile admin from seizing ownership. The trade-off is that lost owner keys freeze the admin list. This matches how SSB, Nostr, and BitTorrent handle identity — keypair loss is permanent.
+
+**Mitigation**: Document in user-facing materials that the owner should back up their private key (stored in `datastore.db`). Future enhancement: multi-sig ownership (requires 2-of-3 owner keys to manage admins).
+
+### 14.3 Wire Format — GossipSub vs. Persistence
+
+Two different serialization contexts:
+
+| Context | Format | Reason |
+|---|---|---|
+| **GossipSub messages** | JSON (utf-8) | Human-debuggable, gossipsub uses string payloads, signatures use canonical JSON (json-canonicalize) |
+| **Bilateral sync stream** | CBOR | Binary stream, larger payloads (deltas), bandwidth matters |
+| **Local persistence** | CBOR | Disk efficiency, native binary signatures |
+
+GossipSub messages are small (single operations, ~500 bytes) so JSON overhead is acceptable. The signature is computed over **canonical JSON** regardless of wire format — this ensures signature portability between contexts.
+
+```
+GossipSub:  peer → JSON.stringify(signedOp) → gossipsub.publish() → topic
+Bilateral:  peer → cbor.encode(delta) → libp2p stream → peer
+Disk:       cbor.encode(fullState) → Bun.write(file)
+```
+
+### 14.4 Update Merge Strategy — Per-Field or Whole Entry?
+
+**Decision: Whole-entry LWW (Last Writer Wins).**
+
+When an update arrives, the **entire entry** is replaced if the incoming HLC is higher than the current one. No per-field merge.
+
+```
+Current state:  { name: "Ubuntu", description: "Official", hlc: 1000 }
+Update from A:  { name: "Ubuntu LTS", hlc: 1005 }             → applied (1005 > 1000)
+Update from B:  { description: "Official ISO", hlc: 1003 }    → rejected (1003 < 1005)
+```
+
+**Why not per-field merge?**
+- Per-field merge requires tracking HLC per field per entry — complexity explosion
+- The signature covers the entire entry — changing one field means re-signing everything anyway
+- Concurrent edits to different fields of the same entry are rare (moderators coordinating)
+- If it happens, one update wins, the other is lost — acceptable for metadata corrections
+
+**Practical impact**: If two moderators edit different fields at the same time, the slower one loses their change. They need to re-apply it. This is the same behavior as Nostr addressable events, SSB, and every LWW register. For a catalog of file metadata, this is perfectly acceptable.
+
+### 14.5 Network Partition (Split Brain)
+
+Two groups of peers get disconnected. Both groups continue writing to their local catalogs.
+
+```
+Partition:
+  Cluster A: peers 1,2,3 — moderator adds "Fedora"
+  Cluster B: peers 4,5,6 — moderator adds "Debian", removes "Arch"
+
+After reconnect:
+  Peers exchange deltas via bilateral sync
+  CRDT merge: union of all add-sets, union of all remove-sets
+  Result: everyone has Fedora + Debian, Arch is removed
+```
+
+**No conflict**: Different entries with different UUIDs merge trivially. Same entry edited in both clusters → LWW by HLC. Tombstones propagate — if one cluster deleted an entry, the deletion wins everywhere.
+
+**ACL during partition**: If cluster A revokes a moderator who is still writing in cluster B, the revocation propagates after reconnect. All operations written by the revoked moderator **after** the revocation timestamp become invalid and are discarded during merge. This is cascading revocation (Farcaster pattern).
+
+**Power-events-first rule (Matrix pattern)**: When merging a batch of operations after reconnect, ACL operations (acl_grant, acl_revoke) are applied **before** catalog operations (add, update, remove). This ensures that a revoked moderator's writes are properly rejected even if they arrive in the same batch.
+
+### 14.6 Field Size Limits
+
+Without size limits, a malicious moderator could publish entries with megabyte descriptions, causing storage and bandwidth abuse.
+
+```typescript
+const FIELD_LIMITS = {
+  name:         256,     // max bytes (UTF-8)
+  description:  4096,    // max bytes (~1 page of text)
+  tags:         10,      // max number of tags
+  tagLength:    32,      // max bytes per tag
+  contentType:  32,      // max bytes (enum, but validated as string)
+} as const;
+
+function validateFieldSizes(entry: CatalogEntry): boolean {
+  if (entry.name && Buffer.byteLength(entry.name) > FIELD_LIMITS.name) return false;
+  if (entry.description && Buffer.byteLength(entry.description) > FIELD_LIMITS.description) return false;
+  if (entry.tags) {
+    if (entry.tags.length > FIELD_LIMITS.tags) return false;
+    if (entry.tags.some(t => Buffer.byteLength(t) > FIELD_LIMITS.tagLength)) return false;
+  }
+  return true;
+}
+```
+
+Field size validation happens **before** signature verification (cheaper operation first, fail fast). An oversized entry is `REJECT`ed at the GossipSub validator level.
+
+**Total maximum entry size**: ~5 KB (with all fields at max). A malicious moderator at max rate (10 ops/min) could produce ~50 KB/min — negligible.
+
+### 14.7 Schema Versioning
+
+What happens when a future LiberShare version adds new fields to CatalogEntry?
+
+```typescript
+interface CatalogSnapshot {
+  version: 1;           // schema version, increment on breaking changes
+  entries: ...;
+  tombstones: ...;
+  // ...
+}
+```
+
+**Versioning strategy**:
+
+| Change type | Action | Example |
+|---|---|---|
+| New optional field | Backward compatible — old peers ignore it | Adding `license?: string` |
+| New required field | Not allowed — breaks old peers | — |
+| Field type change | New version number + migration | `totalSize: string` → `totalSize: number` |
+| Field removal | Deprecate first, remove in next version | Remove `checksumAlgo` after N months |
+
+**Wire protocol versioning**: The bilateral sync protocol already includes a version in its path (`/lish/catalog-sync/1.0.0`). A new schema version would use `/lish/catalog-sync/2.0.0`. Peers negotiate the highest common version during handshake.
+
+**CBOR forward compatibility**: Unknown fields in CBOR are preserved during decode (unlike strict JSON parsers). An old peer receiving a new-format entry will store and forward the unknown fields without losing them — natural forward compatibility.
+
+**GossipSub topic**: The gossipsub topic (`lish/<networkID>`) does NOT include a version. Message format is identified by a `version` field in the JSON payload. Old peers ignore messages with unknown versions (IGNORE, not REJECT — no penalty for new-format messages).
