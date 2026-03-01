@@ -113,7 +113,7 @@ interface CatalogEntry {
   // === Editable metadata (any moderator+ can update) ===
   name?: string;               // Human-readable name
   description?: string;        // Optional description
-  contentType?: 'software' | 'media' | 'document' | 'dataset' | 'archive' | 'other';
+  contentType?: 'software' | 'game' | 'video' | 'audio' | 'image' | 'document' | 'dataset' | 'archive' | 'other';
   tags?: string[];             // max 10 tags, max 32 chars each, lowercase
 
   // === System fields (updated automatically) ===
@@ -2217,7 +2217,7 @@ export interface CatalogEntry {
   // Editable metadata
   name?: string;
   description?: string;
-  contentType?: 'software' | 'media' | 'document' | 'dataset' | 'archive' | 'other';
+  contentType?: 'software' | 'game' | 'video' | 'audio' | 'image' | 'document' | 'dataset' | 'archive' | 'other';
   tags?: string[];
 
   // System fields
