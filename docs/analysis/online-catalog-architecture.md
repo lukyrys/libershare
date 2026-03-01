@@ -574,49 +574,30 @@ This provides probabilistic proof that a publisher actually holds the content th
 
 #### Layer 1: GossipSub Broadcast (Real-Time)
 
-For live operations while peers are connected. Messages are small JSON payloads broadcast to the `lish/<networkID>` topic.
+For live operations while peers are connected. Messages are JSON payloads broadcast to the `lish/<networkID>` topic. The wire format wraps a `SignedCatalogOp` (§11) with a `type` discriminator:
 
 ```typescript
-// Add a LISH to catalog
+// GossipSub message envelope (all catalog operations use the same shape)
 {
-  type: 'catalog_op',
-  op: 'add',
-  entry: CatalogEntry,
-  authorPeerID: string,
-  hlc: HLC,
-  signature: string
+  type: 'catalog_op',          // discriminator — non-catalog messages use other types (e.g. 'want', 'have')
+  payload: CatalogOpPayload,   // { type: 'add'|'update'|'remove'|'acl_grant'|'acl_revoke', networkID, hlc, nonce, data }
+  signature: string,           // base64url Ed25519 signature of canonicalize(payload)
+  signer: string,              // base58btc PeerID of the signer
+  keyType: 'Ed25519',
 }
 
-// Update metadata of existing LISH (any moderator+ can edit any entry)
-{
-  type: 'catalog_op',
-  op: 'update',
-  lishID: string,
-  fields: { name?, description?, contentType?, tags? },
-  authorPeerID: string,
-  hlc: HLC,
-  signature: string
-}
+// payload.data varies by operation type:
+//   add:        CatalogEntry (without hlc/signature — those come from the envelope)
+//   update:     { lishID: string, fields: { name?, description?, contentType?, tags? } }
+//   remove:     { lishID: string }
+//   acl_grant:  ACLChange { action: 'grant', role, peerIDs }
+//   acl_revoke: ACLChange { action: 'revoke', role, peerIDs }
+```
 
-// Remove a LISH from catalog
-{
-  type: 'catalog_op',
-  op: 'remove',
-  lishID: string,
-  removedByPeerID: string,
-  hlc: HLC,
-  signature: string
-}
-
-// Grant or revoke ACL role
-{
-  type: 'catalog_op',
-  op: 'acl_grant' | 'acl_revoke',
-  change: ACLChange,
-  authorPeerID: string,
-  hlc: HLC,
-  signature: string
-}
+**Broadcast code** (from §15.5 step 6):
+```typescript
+network.broadcast(lishTopic(networkID), { type: 'catalog_op', ...signedOp });
+// Produces: { type: 'catalog_op', payload: {...}, signature, signer, keyType }
 ```
 
 #### Layer 2: Bilateral Stream (Catch-Up Sync)
@@ -1959,14 +1940,14 @@ A large catalog sync (50K entries, ~25 MB CBOR) could take 100+ ms to decode. Du
 **Solution**: Chunk processing with `setImmediate()`:
 
 ```typescript
-async function processSyncDelta(entries: CatalogEntry[], crdt: CatalogCRDT): Promise<void> {
+async function processSyncDelta(ops: SignedCatalogOp[], crdt: CatalogCRDT): Promise<void> {
   const BATCH_SIZE = 500;
-  for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-    const batch = entries.slice(i, i + BATCH_SIZE);
-    for (const entry of batch) {
-      crdt.mergeEntry(entry);  // signature verification + merge
+  for (let i = 0; i < ops.length; i += BATCH_SIZE) {
+    const batch = ops.slice(i, i + BATCH_SIZE);
+    for (const op of batch) {
+      crdt.mergeSyncOp(op);  // signature verification + CRDT merge
     }
-    // Yield to event loop every 500 entries
+    // Yield to event loop every 500 operations
     await new Promise(resolve => setImmediate(resolve));
   }
 }
@@ -2028,6 +2009,8 @@ class CatalogCRDT {
 ```
 
 Maximum one disk write per 500ms regardless of incoming operation rate. On shutdown, `flush()` is called to ensure no data loss.
+
+**Note**: The `scheduleSave()`/`flush()` code above is a simplified draft. The authoritative version is in section 16.3 (`CatalogCRDT` unified class), which adds `await saveCatalog()` in `flush()` and `this.saveTimer = null` cleanup.
 
 ---
 
@@ -2280,7 +2263,7 @@ class CatalogCRDT {
 
   // === CRDT merge (core) ===
   private applyDataOp(op: SignedCatalogOp): void {
-    /* §18.2 — also stores op in opLog: this.state.opLog.set(lishID, op) */
+    /* §18.2 — handles add/update/remove + stores op in opLog */
   }
   private applyACLOp(op: SignedCatalogOp): void { /* §18.2 */ }
 
@@ -2313,10 +2296,7 @@ class CatalogCRDT {
     // 5. Update vector clock by signer (not publisherPeerID — signer is the author
     //    of the current version, which may differ from original publisher after updates)
     this.state.vectorClock.set(op.signer, op.payload.hlc);
-
-    // 6. Store in opLog for future sync forwarding
-    const lishID = (op.payload.data as any).lishID;
-    if (lishID) this.state.opLog.set(lishID, op);
+    // Note: opLog storage happens inside applyDataOp() — no duplicate store needed here
   }
 
   // === Sync (bilateral) ===
@@ -2693,7 +2673,7 @@ frontend/src/
 ```
 
 **Total new files**: 9 backend + 1 shared + 1 frontend script = 11 new files
-**Total edited files**: 6 (server.ts, network.ts, networks.ts, app.ts, Products.svelte, ProductsItem.svelte, shared/index.ts)
+**Total edited files**: 7 (server.ts, network.ts, network-config.ts, networks.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
 
 ---
 
@@ -3176,6 +3156,10 @@ class CatalogCRDT {
         break;
       }
     }
+
+    // Store in opLog for bilateral sync forwarding (every applied data op is preserved)
+    const lishID = (op.payload.data as any).lishID;
+    if (lishID) this.state.opLog.set(lishID, op);
   }
 }
 ```
