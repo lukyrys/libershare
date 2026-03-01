@@ -1,8 +1,8 @@
 # LiberShare Online Catalog (DB LISHs) - Architecture Analysis
 
-**Date**: 2026-02-28 (updated 2026-02-28)
+**Date**: 2026-02-28 (updated 2026-03-01)
 **Branch**: `feat/online-db`
-**Status**: Design phase - Research iteration 6 (hardening: GC, rate limits, topic validators, error handling, upgrade path)
+**Status**: Complete — ready for Phase 1 implementation
 **Author**: Analysis by Claude, discussed with Jiri Kreibich
 **Research sources**: libp2p source code, IPFS Cluster, go-ds-crdt, Nostr NIPs, Matrix, Farcaster, BitTorrent BEP-52, gossipsub v1.1 spec
 
@@ -517,7 +517,7 @@ Peers below `gossipThreshold` (-10) are progressively isolated without requiring
 // See section 17.3 for the full RateLimiter class implementation.
 // Constants defined there:
 //   maxOpsPerPeerPerMinute: 10
-////   maxOpsGlobalPerMinute: 100
+//   maxOpsGlobalPerMinute: 100
 //   maxEntriesPerPublisher: 1000
 //   maxCatalogSize: 50_000
 
@@ -1731,7 +1731,7 @@ export class CatalogManager {
     const path = `${this.dataDir}/catalog/${networkID}.cbor`;
     const snapshot = await loadCatalog(path);
 
-    const crdt = new CatalogCRDT(networkID, ownerPeerID, this.network);
+    const crdt = new CatalogCRDT(networkID, ownerPeerID, this.network, this.dataDir);
     if (snapshot) {
       crdt.loadFromSnapshot(snapshot);
     }
@@ -2173,21 +2173,107 @@ The document describes bilateral sync but never specifies **when** it runs.
    - Otherwise skip (periodic anti-entropy will catch it)
 ```
 
-**Sync manager** (per CatalogCRDT):
+**CatalogCRDT class — unified shape** (implementations are spread across sections 15.10, 17.8, 18.2):
 
 ```typescript
 class CatalogCRDT {
+  // === Public/readonly fields ===
   readonly networkID: string;
+
+  // === Private fields ===
   private readonly ownerPeerID: string;
   private readonly network: Network;
-  private antiEntropyTimer: Timer | null = null;
+  private readonly path: string;                    // catalog/<networkID>.cbor
+  private state: CatalogCRDTState;                  // in-memory CRDT state
+  private opQueue: Promise<void> = Promise.resolve(); // per-network mutation serializer (§15.10)
+  private saveTimer: Timer | null = null;           // debounced persistence (§15.10)
+  private dirty: boolean = false;                   // pending unsaved changes
+  private antiEntropyTimer: Timer | null = null;    // periodic sync timer
 
-  constructor(networkID: string, ownerPeerID: string, network: Network) {
+  constructor(networkID: string, ownerPeerID: string, network: Network, dataDir: string) {
     this.networkID = networkID;
     this.ownerPeerID = ownerPeerID;
     this.network = network;
+    this.path = `${dataDir}/catalog/${networkID}.cbor`;
+    // Initialize empty state — overwritten by loadFromSnapshot() if file exists
+    this.state = {
+      networkID,
+      entries: new Map(),
+      tombstones: new Map(),
+      access: { owner: ownerPeerID, admins: [], moderators: [], restrictCatalogWrites: false },
+      vectorClock: new Map(),
+      localClock: { wallTime: Date.now(), logical: 0, nodeID: network.getNodeInfo().peerID },
+      syncState: new Map(),
+    };
   }
 
+  // === Lifecycle ===
+  loadFromSnapshot(snapshot: CatalogSnapshot): void { /* restore state from CBOR */ }
+  getState(): CatalogCRDTState { return this.state; }
+  async flush(): Promise<void> { /* §15.10: save immediately, clear timer */ }
+
+  // === Query methods (called by API handlers) ===
+  getEntry(lishID: string): CatalogEntry | undefined { return this.state.entries.get(lishID); }
+  list(opts: { limit: number; cursor?: string; sort: string }): CatalogListResult { /* §16.2 */ }
+  search(query: string): CatalogEntry[] { /* §15.7 */ }
+  getAccess(): ICatalogAccess { return this.state.access; }
+  getSyncStatus(): CatalogSyncStatus { /* entry/tombstone counts, last sync, peer count */ }
+
+  // === Mutation methods (called by API handlers, go through enqueueOperation) ===
+  async publish(lish: IStoredLISH, opts?: PublishOptions): Promise<void> { /* §15.5 */ }
+  async updateEntry(lishID: string, fields: Record<string, any>): Promise<void> { /* sign + apply + broadcast */ }
+  async removeEntry(lishID: string): Promise<void> { /* sign + apply tombstone + broadcast */ }
+  async updateAccess(changes: ACLChange): Promise<void> { /* sign + apply ACL + broadcast */ }
+
+  // === Remote operation handling ===
+  async handleRemoteOperation(msg: Record<string, any>): Promise<void> { /* §17.8 */ }
+  async handleSyncStream(stream: Stream, request: any): Promise<void> { /* respond to bilateral sync */ }
+
+  // === CRDT merge (core) ===
+  private applyDataOp(op: SignedCatalogOp): void { /* §18.2 */ }
+  private applyACLOp(op: SignedCatalogOp): void { /* §18.2 */ }
+
+  /**
+   * Merge a single CatalogEntry received via bilateral sync.
+   * Unlike handleRemoteOperation (which receives full SignedCatalogOp messages
+   * from GossipSub), bilateral sync delivers raw entries with embedded signatures.
+   * Each entry is re-validated before merge (the peer may be malicious).
+   */
+  private mergeEntry(entry: CatalogEntry): void {
+    // Verify signature embedded in entry
+    // (reconstruct minimal SignedCatalogOp for verifyCatalogOp)
+    // Tombstone check: skip if tombstoned with higher HLC
+    const tombstone = this.state.tombstones.get(entry.lishID);
+    if (tombstone && hlcCompare(tombstone.hlc, entry.hlc) > 0) return;
+
+    // LWW merge: only replace if incoming HLC is higher
+    const existing = this.state.entries.get(entry.lishID);
+    if (!existing || hlcCompare(entry.hlc, existing.hlc) > 0) {
+      this.state.entries.set(entry.lishID, entry);
+    }
+
+    // Update vector clock for entry's publisher
+    const lastSeen = this.state.vectorClock.get(entry.publisherPeerID);
+    if (!lastSeen || hlcCompare(entry.hlc, lastSeen) > 0) {
+      this.state.vectorClock.set(entry.publisherPeerID, entry.hlc);
+    }
+  }
+
+  /**
+   * Merge a tombstone received via bilateral sync.
+   * Tombstone with higher HLC always wins (remove-wins semantics).
+   */
+  private mergeTombstone(tombstone: TombstoneEntry): void {
+    // Verify signature embedded in tombstone
+    const existing = this.state.tombstones.get(tombstone.lishID);
+    if (!existing || hlcCompare(tombstone.hlc, existing.hlc) > 0) {
+      this.state.tombstones.set(tombstone.lishID, tombstone);
+    }
+    // Remove from active entries if present
+    this.state.entries.delete(tombstone.lishID);
+  }
+
+  // === Sync (bilateral) ===
   startAntiEntropy(): void {
     this.antiEntropyTimer = setInterval(() => {
       this.trySync();
@@ -2202,20 +2288,13 @@ class CatalogCRDT {
   private async trySync(): Promise<void> {
     const peers = this.network.getTopicPeers(this.networkID);
     if (peers.length === 0) return;
-
-    // Pick random peer
     const peer = peers[Math.floor(Math.random() * peers.length)]!;
     await this.bilateralSync(peer);
   }
 
-  /**
-   * Initiate bilateral sync with a remote peer.
-   * Opens a /lish/catalog-sync/1.0.0 stream and exchanges deltas.
-   */
   private async bilateralSync(peerID: string): Promise<void> {
     try {
       const stream = await this.network.dialProtocol(peerID, '/lish/catalog-sync/1.0.0');
-      // Send our vector summary and known lishIDs
       const request = encoder.encode({
         command: 'catalog_sync_req',
         requestID: crypto.randomUUID(),
@@ -2225,7 +2304,6 @@ class CatalogCRDT {
       });
       stream.sink([request]);
 
-      // Read response (CBOR delta)
       let responseBytes = new Uint8Array();
       for await (const chunk of stream.source) {
         responseBytes = concat([responseBytes, chunk.subarray()]);
@@ -2236,19 +2314,23 @@ class CatalogCRDT {
       }
 
       const response = decoder.decode(responseBytes);
-      // Merge delta entries (each validated before merge)
       for (const entry of response.entries ?? []) {
         this.mergeEntry(entry);
       }
       for (const tombstone of response.tombstones ?? []) {
         this.mergeTombstone(tombstone);
       }
+      // Run tombstone GC after sync (§17.2)
+      garbageCollectTombstones(this.state);
       this.scheduleSave();
     } catch (err) {
       console.error(`Bilateral sync with ${peerID} failed:`, err);
-      // Will retry on next anti-entropy cycle
     }
   }
+
+  // === Internal helpers ===
+  async enqueueOperation(op: () => Promise<void>): Promise<void> { /* §15.10 */ }
+  private scheduleSave(): void { /* §15.10: debounced 500ms write */ }
 }
 ```
 
@@ -2705,9 +2787,24 @@ The security checklist requires "topic validator registered for catalog topics".
 
 **Decision: Register a topic validator that validates signatures and rate limits.**
 
+**Network class extension needed**: The `pubsub.topicValidators` map is not directly accessible from outside `Network`. Add a `registerTopicValidator(topic, validator)` method to `Network` class (similar to `registerStreamHandler()` in section 15.4):
+
+```typescript
+// Addition to Network class (network.ts)
+registerTopicValidator(
+  topic: string,
+  validator: (peerID: PeerId, msg: Message) => Promise<TopicValidatorResult>
+): void {
+  if (!this.node) throw new Error('Network not started');
+  (this.node.services.pubsub as any).topicValidators.set(topic, validator);
+}
+```
+
+**Validator implementation**:
+
 ```typescript
 // Registered once per network topic in CatalogManager.join()
-pubsub.topicValidators.set(lishTopic(networkID), async (peerID, msg) => {
+network.registerTopicValidator(lishTopic(networkID), async (peerID, msg) => {
   try {
     const data = JSON.parse(new TextDecoder().decode(msg.data));
     if (data.type !== 'catalog_op') return TopicValidatorResult.Accept;  // not a catalog message
