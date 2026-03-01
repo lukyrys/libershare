@@ -204,10 +204,11 @@ libp2p already provides this. Each peer has an Ed25519 keypair:
 Every catalog operation (add, update, remove, ACL change) MUST include an Ed25519 signature from the author's private key. Receiving peers verify the signature before applying the operation.
 
 ```typescript
+// Conceptual model — see section 11 for the canonical implementation type (SignedCatalogOp)
 interface SignedOperation {
   op: 'add' | 'update' | 'remove' | 'acl_grant' | 'acl_revoke';
   payload: CatalogEntry | CatalogUpdate | TombstoneEntry | ACLChange;
-  authorPeerID: string;        // Who created this operation
+  authorPeerID: string;        // Who created this operation (called `signer` in SignedCatalogOp)
   hlc: HLC;                   // Hybrid Logical Clock (monotonically increasing per author)
   signature: string;           // Ed25519 sign(payload + authorPeerID + hlc)
 }
@@ -230,7 +231,9 @@ interface ACLChange {
 }
 ```
 
-**What is signed**: The signature covers the **entire payload + authorPeerID + HLC**, serialized as canonical JSON (sorted keys, no whitespace). This prevents:
+**Note**: `SignedOperation` here is the conceptual model for validation logic. The concrete implementation type is `SignedCatalogOp` (section 11), which wraps the operation in a `CatalogOpPayload` with additional fields (`networkID`, `nonce`) for cross-network replay resistance. During implementation, `validateOperation()` receives a `SignedCatalogOp` and extracts `op.payload.type` as the operation type, `op.signer` as the author PeerID, and `op.payload.hlc` as the HLC.
+
+**What is signed**: The signature covers the **entire payload** (including type, networkID, HLC, nonce, and data), serialized as canonical JSON (sorted keys, no whitespace, via `json-canonicalize`). This prevents:
 
 - **Payload tampering**: Changing any field invalidates the signature
 - **Author spoofing**: Only the real author's private key can produce a valid signature
@@ -791,6 +794,7 @@ data/
 ```typescript
 // backend/src/catalog/catalog-persistence.ts
 import { Encoder, Decoder } from 'cbor-x';
+import { renameSync, existsSync, unlinkSync } from 'fs';
 
 const encoder = new Encoder({ mapsAsObjects: true, useRecords: false });
 const decoder = new Decoder({ mapsAsObjects: true });
@@ -805,8 +809,9 @@ interface CatalogSnapshot {
   syncState: Record<string, HLC>;
 }
 
-export function saveCatalog(path: string, state: CatalogCRDTState): void {
+export async function saveCatalog(path: string, state: CatalogCRDTState): Promise<void> {
   const snapshot: CatalogSnapshot = {
+    version: 1,
     entries: [...state.entries.values()],
     tombstones: [...state.tombstones.values()],
     access: state.access,
@@ -815,16 +820,31 @@ export function saveCatalog(path: string, state: CatalogCRDTState): void {
     syncState: Object.fromEntries(state.syncState),
   };
   const bytes = encoder.encode(snapshot);
-  Bun.write(path, bytes);  // atomic write
+
+  // Crash-safe: write to temp file, then rename (atomic on POSIX, near-atomic on NTFS)
+  const tmpPath = path + '.tmp';
+  await Bun.write(tmpPath, bytes);
+  renameSync(tmpPath, path);
 }
 
-export function loadCatalog(path: string): CatalogSnapshot | null {
-  try {
-    const bytes = new Uint8Array(Bun.file(path).arrayBuffer());
-    return decoder.decode(bytes);
-  } catch {
-    return null;  // file missing or corrupt → start fresh, sync from peers
+export async function loadCatalog(path: string): Promise<CatalogSnapshot | null> {
+  // Try main file first, then temp file (crash recovery)
+  for (const candidate of [path, path + '.tmp']) {
+    try {
+      if (!existsSync(candidate)) continue;
+      const buf = await Bun.file(candidate).arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const snapshot = decoder.decode(bytes) as CatalogSnapshot;
+      // Clean up stale temp file if main file loaded successfully
+      if (candidate === path && existsSync(path + '.tmp')) {
+        try { unlinkSync(path + '.tmp'); } catch {}
+      }
+      return snapshot;
+    } catch {
+      continue;  // corrupt file, try next candidate
+    }
   }
+  return null;  // all files missing or corrupt → start fresh, sync from peers
 }
 ```
 
@@ -938,7 +958,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - Crash-safe CBOR persistence (write-then-rename, debounced saves)
 - `CatalogManager` class (multi-lishnet lifecycle, load/unload catalogs)
 - Add `ownerPeerID` field to `ILISHNetwork` shared type
-- Add `getPrivateKey()` accessor to `Network` class
+- Add `getPrivateKey()` and `registerStreamHandler()` to `Network` class
 - Unit tests for merge correctness, security validation, crash recovery
 
 ### Phase 2: Sync + GossipSub Integration (Backend)
@@ -1024,7 +1044,8 @@ Two new dependencies needed:
 
 ```bash
 bun add json-canonicalize   # RFC 8785 JCS for deterministic JSON serialization (signing)
-bun add cbor-x              # RFC 8949 CBOR binary encoding (persistence)
+bun add cbor-x              # RFC 8949 CBOR binary encoding (persistence + bilateral sync)
+bun add uint8arrays          # Uint8Array utilities (concat for stream reading) — already a libp2p transitive dep
 ```
 
 `@libp2p/peer-id` is already a transitive dependency of `libp2p`.
@@ -1119,13 +1140,15 @@ interface DelegationToken {
     delegatee: string;     // PeerID receiving the role
     role: 'admin' | 'moderator';
     grantedAt: number;
-    expiresAt: number | null;
     nonce: string;
   };
   signature: string;
   signer: string;          // == delegator
   keyType: 'Ed25519';
 }
+// Note: Token expiry (expiresAt) intentionally omitted. In a P2P system
+// without consensus, expiry is unreliable (clock skew). Revocation via
+// acl_revoke is the correct mechanism for removing permissions.
 
 // Verification: walk the chain
 // Owner (from .lishnet) → signed admin grant → signed moderator grant
@@ -1472,35 +1495,39 @@ The catalog system operates on a **higher layer** than the existing protocol. Th
 | `want/have` | **Kept** | Downloader protocol unchanged |
 | `manage_members` | **Split** | Network-level roles (publisher/downloader) stay in network config. Catalog-level roles (admin/moderator) managed via `catalog_op.acl_grant/acl_revoke` |
 
-**Migration path**: Old `add_lish` messages on the gossipsub topic are ignored by the new catalog layer (they lack signatures). New `catalog_op` messages are ignored by old peers (unknown `type` field). Both can coexist on the same `lish/<networkID>` topic during transition.
+**Migration path**: The catalog layer filters on `msg.type === 'catalog_op'` — old messages (`add_lish`, `del_lish`) are simply not dispatched to the catalog handler. New `catalog_op` messages are ignored by old peers (unknown `type` field). Both coexist on the same `lish/<networkID>` topic during transition.
 
-### 15.2 Role Model: INetworkAccess vs ICatalogAccess
+### 15.2 Role Model: Protocol Spec vs Catalog ACL
 
-The existing protocol defines `INetworkAccess` with roles: owners, admins, publishers, downloaders. The catalog introduces `ICatalogAccess` with roles: owner, admins, moderators.
+**Important**: The `LISH_NETWORK_PROTOCOL.md` defines an `INetworkAccess` interface with roles (owners, admins, publishers, downloaders), but **this interface does not exist in the TypeScript codebase**. The implemented types are `ILISHNetwork` and `LISHNetworkConfig` (in `shared/src/index.ts`), which have no role fields. The protocol spec roles were never implemented.
 
-**Decision: Two separate role systems for two separate concerns.**
+The catalog system introduces `ICatalogAccess` as the **first actual implementation of access control**:
 
 ```
-INetworkAccess (existing, in .lishnet file):
-  owners       → control network config (name, bootstrap peers)
-  admins       → manage publishers and downloaders
-  publishers   → can share files (seed) to the network
-  downloaders  → can download from the network
+Current codebase (implemented):
+  ILISHNetwork / LISHNetworkConfig:
+    networkID, name, description, bootstrapPeers, enabled
+    → NO role fields, no access control
 
-ICatalogAccess (new, replicated via CRDT):
-  owner        → single PeerID, controls admin list, immutable
-  admins       → manage moderator list
-  moderators   → can add/update/remove catalog entries
+Protocol spec (LISH_NETWORK_PROTOCOL.md, NOT implemented):
+  INetworkAccess:
+    owners, admins, publishers, downloaders
+    → Document-only, not in TypeScript code
+
+Catalog system (new, to be implemented):
+  ICatalogAccess:
+    owner        → single PeerID, controls admin list, immutable
+    admins       → manage moderator list
+    moderators   → can add/update/remove catalog entries
 ```
 
-**Relationship**:
-- `INetworkAccess.owners[0]` becomes `ICatalogAccess.owner` when initializing a new catalog
-- `INetworkAccess.publishers` controls who can **seed files** (data layer)
+**Decision**: `ICatalogAccess` is the first real access control. The catalog owner is seeded from `ILISHNetwork.ownerPeerID` — the new field defined in section 15.3. The protocol spec's `INetworkAccess` roles (publisher/downloader) remain unimplemented and are a separate concern for future data-layer access control.
+
+**Relationship between data and catalog layers**:
 - `ICatalogAccess.moderators` controls who can **write catalog metadata** (catalog layer)
-- A peer can be a publisher (allowed to seed) but not a moderator (not allowed to write catalog)
+- Downloads and seeding remain open to everyone (no access control on data layer yet)
 - A peer can be a moderator (writes catalog) but downloads are open to everyone regardless
-
-**Why not merge them?** The existing `INetworkAccess` is stored in the `.lishnet` config file and managed via `manage_members` messages. The catalog ACL must be replicated via signed CRDT operations with the full chain-of-trust model. Merging would require changing the `.lishnet` format and migrating existing networks.
+- Future: `INetworkAccess`-style publisher/downloader restrictions can be implemented independently
 
 ### 15.3 .lishnet File: Owner PeerID Field
 
@@ -1539,22 +1566,16 @@ export interface ILISHNetwork {
 
 **Validation**: `ownerPeerID` must be a valid Ed25519 PeerID (starts with `12D3KooW`). If present, it becomes `ICatalogAccess.owner`. If missing, catalog features are disabled for that network.
 
-### 15.4 Private Key Access for Signing
+### 15.4 Required Network Class Extensions
 
-The `Network` class stores the Ed25519 private key privately and never exposes it:
+The `Network` class needs two new public methods for the catalog system:
 
-```typescript
-// network.ts — private key loaded in start(), stored nowhere accessible
-const privateKey = await this.loadOrCreatePrivateKey(this.datastore);
-// ... used only for node creation, never exposed
-```
+**1. Private key access for signing**
 
-The catalog signer needs the private key to sign operations.
-
-**Decision: Add a `getPrivateKey()` accessor to `Network`.**
+The Ed25519 private key is loaded in `start()` but never exposed. The catalog signer needs it.
 
 ```typescript
-// Addition to Network class
+// Additions to Network class (network.ts)
 private privateKey: PrivateKey | null = null;
 
 async start(bootstrapPeers: string[] = []): Promise<void> {
@@ -1570,7 +1591,28 @@ getPrivateKey(): PrivateKey {
 }
 ```
 
-**Security consideration**: The private key is already in memory (used by libp2p internally). Exposing it to the catalog module is no additional risk — both run in the same Bun process. The key never leaves the backend process; it's used only for signing catalog operations before broadcast.
+**Security consideration**: The private key is already in memory (used by libp2p internally). Exposing it to the catalog module is no additional risk — both run in the same Bun process.
+
+**2. Bilateral stream handler registration**
+
+The bilateral sync protocol (`/lish/catalog-sync/1.0.0`) needs to register a handler on the libp2p node. The `node` field is private, and only `dialProtocol()` (outbound) is public. A new method is needed:
+
+```typescript
+// Addition to Network class (network.ts)
+async registerStreamHandler(
+  protocol: string,
+  handler: (stream: Stream) => Promise<void>
+): Promise<void> {
+  if (!this.node) throw new Error('Network not started');
+  await this.node.handle(
+    protocol,
+    async ({ stream }) => handler(stream),
+    { runOnLimitedConnection: true }
+  );
+}
+```
+
+This mirrors the existing `LISH_PROTOCOL` handler registration pattern in `start()` (line 194-199 of `network.ts`).
 
 ### 15.5 End-to-End Publish Flow
 
@@ -1593,7 +1635,7 @@ How `catalog.publish(networkID, lishID)` works from API call to broadcast:
      fileCount: lish.files.length,
      totalSize: lish.files.reduce((sum, f) => sum + f.size, 0),
      manifestHash: sha256(canonicalize(lish)),  // integrity anchor
-     name: lish.name ?? lish.id,
+     name: lish.name,                             // undefined if not set (UI shows lishID as fallback)
      hlc: hlcTick(localClock),
      signature: '',  // filled below
    };
@@ -1633,6 +1675,7 @@ export class CatalogManager {
   private catalogs: Map<string, CatalogCRDT> = new Map();
   private readonly dataDir: string;
   private readonly network: Network;
+  private syncHandlerRegistered: boolean = false;
 
   constructor(dataDir: string, network: Network) {
     this.dataDir = dataDir;
@@ -1640,15 +1683,40 @@ export class CatalogManager {
   }
 
   /**
+   * Register the bilateral sync handler (once, shared by all catalogs).
+   * libp2p allows only one handler per protocol path, so CatalogManager
+   * owns the handler and dispatches by networkID from the request body.
+   */
+  private async ensureSyncHandler(): Promise<void> {
+    if (this.syncHandlerRegistered) return;
+    await this.network.registerStreamHandler(
+      '/lish/catalog-sync/1.0.0',
+      async (stream) => {
+        const request = await readSyncRequest(stream);  // CBOR decode
+        const crdt = this.catalogs.get(request.networkID);
+        if (crdt) {
+          await crdt.handleSyncStream(stream, request);
+        }
+        // Unknown networkID → close stream silently
+      }
+    );
+    this.syncHandlerRegistered = true;
+  }
+
+  /**
    * Load or create a catalog for a lishnet.
    * Called when a lishnet is joined (enabled).
+   * ownerPeerID comes from ILISHNetwork.ownerPeerID — if absent, catalog is not created.
    */
   async join(networkID: string, ownerPeerID: string): Promise<void> {
     if (this.catalogs.has(networkID)) return;
 
+    // Ensure bilateral sync handler is registered (once)
+    await this.ensureSyncHandler();
+
     // Load from disk or create fresh
     const path = `${this.dataDir}/catalog/${networkID}.cbor`;
-    const snapshot = loadCatalog(path);
+    const snapshot = await loadCatalog(path);
 
     const crdt = new CatalogCRDT(networkID, ownerPeerID, this.network);
     if (snapshot) {
@@ -1657,26 +1725,22 @@ export class CatalogManager {
 
     this.catalogs.set(networkID, crdt);
 
-    // Register GossipSub handler for catalog_op messages
-    this.network.subscribe(lishTopic(networkID), (msg) => {
+    // Register GossipSub handler for catalog_op messages on this network's topic
+    await this.network.subscribe(lishTopic(networkID), (msg) => {
       if (msg.type === 'catalog_op') {
         crdt.handleRemoteOperation(msg);
-        saveCatalog(path, crdt.getState());
+        crdt.scheduleSave();  // debounced persistence
       }
     });
-
-    // Register bilateral sync protocol handler
-    // (one handler per joined network)
-    crdt.startSyncListener();
   }
 
   /**
    * Unload a catalog when leaving a lishnet.
    */
-  leave(networkID: string): void {
+  async leave(networkID: string): Promise<void> {
     const crdt = this.catalogs.get(networkID);
     if (!crdt) return;
-    crdt.stopSyncListener();
+    await crdt.flush();  // persist any pending changes
     this.catalogs.delete(networkID);
   }
 
@@ -1686,10 +1750,29 @@ export class CatalogManager {
   get(networkID: string): CatalogCRDT | undefined {
     return this.catalogs.get(networkID);
   }
+
+  /**
+   * Flush all catalogs (called on graceful shutdown).
+   */
+  async flushAll(): Promise<void> {
+    for (const crdt of this.catalogs.values()) {
+      await crdt.flush();
+    }
+  }
 }
 ```
 
-**Integration with Networks class**: `CatalogManager` is created alongside `Networks` in `app.ts`. When `networks.setEnabled(id, true)` is called, it also calls `catalogManager.join(id, ownerPeerID)`. When disabled, `catalogManager.leave(id)`.
+**Integration with Networks class**: `CatalogManager` is created alongside `Networks` in `app.ts`, receiving `networks.getNetwork()` as its `Network` dependency. When `networks.setEnabled(id, true)` is called, it also calls:
+
+```typescript
+const net = networks.get(id);
+if (net?.ownerPeerID) {
+  await catalogManager.join(id, net.ownerPeerID);
+}
+// Networks without ownerPeerID skip catalog (v1 .lishnet files)
+```
+
+When disabled, `await catalogManager.leave(id)`. On shutdown, `await catalogManager.flushAll()`.
 
 **Memory**: Each `CatalogCRDT` holds its catalog in memory. For a typical lishnet with 1K entries (~500 KB), having 10 joined lishnets costs ~5 MB RAM. Acceptable.
 
@@ -1706,21 +1789,37 @@ function searchCatalog(entries: CatalogEntry[], query: string): CatalogEntry[] {
 
   const terms = q.split(/\s+/);
 
-  return entries.filter(entry => {
-    const searchable = [
-      entry.name ?? '',
-      entry.description ?? '',
-      entry.contentType ?? '',
-      ...(entry.tags ?? []),
-    ].join(' ').toLowerCase();
+  return entries
+    .filter(entry => {
+      const searchable = [
+        entry.name ?? '',
+        entry.description ?? '',
+        entry.contentType ?? '',
+        ...(entry.tags ?? []),
+      ].join(' ').toLowerCase();
 
-    // All terms must match (AND logic)
-    return terms.every(term => searchable.includes(term));
-  });
+      // All terms must match (AND logic)
+      return terms.every(term => searchable.includes(term));
+    })
+    .sort((a, b) => {
+      // Relevance scoring: name match (2) > tag match (1) > description-only match (0)
+      const score = (e: CatalogEntry): number => {
+        const name = (e.name ?? '').toLowerCase();
+        const tags = (e.tags ?? []).join(' ').toLowerCase();
+        let s = 0;
+        for (const term of terms) {
+          if (name.includes(term)) s += 2;
+          else if (tags.includes(term)) s += 1;
+        }
+        return s;
+      };
+      const diff = score(b) - score(a);
+      if (diff !== 0) return diff;
+      // Tiebreaker: newest first (by HLC)
+      return hlcCompare(b.hlc, a.hlc);
+    });
 }
 ```
-
-**Sort order**: Results sorted by relevance (name match > tag match > description match) with HLC as tiebreaker (newest first).
 
 **Phase 2: SQLite FTS5** (when catalogs exceed 10K entries or users request fulltext):
 
@@ -1765,6 +1864,9 @@ The `/lish/catalog-sync/1.0.0` bilateral stream can fail in several ways:
 **Stream protocol**:
 
 ```typescript
+import { concat } from 'uint8arrays/concat';
+const MAX_SYNC_PAYLOAD = 10 * 1024 * 1024;  // 10 MB
+
 async function handleCatalogSyncStream(stream: Stream): Promise<void> {
   const timeout = setTimeout(() => stream.abort(new Error('timeout')), 30_000);
 
@@ -1779,7 +1881,7 @@ async function handleCatalogSyncStream(stream: Stream): Promise<void> {
         stream.abort(new Error('payload too large'));
         return;
       }
-      requestBytes = concat(requestBytes, chunk);
+      requestBytes = concat([requestBytes, chunk.subarray()]);
     }
 
     const request = decoder.decode(requestBytes);
@@ -1804,48 +1906,11 @@ async function handleCatalogSyncStream(stream: Stream): Promise<void> {
 
 `Bun.write(path, bytes)` is **not guaranteed atomic** on all filesystems. A crash during write can corrupt the file.
 
-**Decision: Rename trick (write-then-rename).**
+**Decision: Rename trick (write-then-rename).** Implemented in `saveCatalog()` and `loadCatalog()` in section 6:
 
-```typescript
-export function saveCatalog(path: string, state: CatalogCRDTState): void {
-  const snapshot: CatalogSnapshot = {
-    version: 1,
-    entries: [...state.entries.values()],
-    tombstones: [...state.tombstones.values()],
-    access: state.access,
-    vectorClock: Object.fromEntries(state.vectorClock),
-    localClock: state.localClock,
-    syncState: Object.fromEntries(state.syncState),
-  };
-  const bytes = encoder.encode(snapshot);
-
-  // Write to temp file, then rename (atomic on POSIX, near-atomic on Windows/NTFS)
-  const tmpPath = path + '.tmp';
-  Bun.write(tmpPath, bytes);
-  const fs = require('fs');
-  fs.renameSync(tmpPath, path);
-}
-```
-
-**On load**: If the main file is corrupt (CBOR decode fails), check for `.tmp` file:
-
-```typescript
-export function loadCatalog(path: string): CatalogSnapshot | null {
-  try {
-    const bytes = new Uint8Array(Bun.file(path).arrayBuffer());
-    return decoder.decode(bytes);
-  } catch {
-    // Main file corrupt — try temp file
-    try {
-      const tmpPath = path + '.tmp';
-      const bytes = new Uint8Array(Bun.file(tmpPath).arrayBuffer());
-      return decoder.decode(bytes);
-    } catch {
-      return null;  // both corrupt → sync from peers
-    }
-  }
-}
-```
+- `saveCatalog()` writes to `.tmp` file first, then `renameSync()` atomically replaces the main file
+- `loadCatalog()` tries main file first, falls back to `.tmp` if corrupt (crash recovery)
+- Both functions are `async` (using `await Bun.file().arrayBuffer()`)
 
 **Worst case**: Both files are corrupt → treated as fresh start, bilateral sync from peers restores the full catalog. The CRDT state is always fully reconstructable from the network.
 
