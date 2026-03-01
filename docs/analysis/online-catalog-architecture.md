@@ -1332,17 +1332,82 @@ interface CatalogSnapshot {
 }
 ```
 
-**Versioning strategy**:
+**Field obligation levels**:
 
-| Change type | Action | Example |
+| Level | Meaning | Examples |
 |---|---|---|
-| New optional field | Backward compatible — old peers ignore it | Adding `license?: string` |
-| New required field | Not allowed — breaks old peers | — |
-| Field type change | New version number + migration | `totalSize: string` → `totalSize: number` |
-| Field removal | Deprecate first, remove in next version | Remove `checksumAlgo` after N months |
+| **Structurally required** | Entry cannot exist without it. Part of identity/integrity. Never changes. | lishID, publisherPeerID, hlc, signature |
+| **Functionally required** | New entries must have it. Old entries without it are tolerated. | (none yet — added via migration) |
+| **Optional** | Can be missing. UI shows "not specified". | description, tags, contentType |
 
-**Wire protocol versioning**: The bilateral sync protocol already includes a version in its path (`/lish/catalog-sync/1.0.0`). A new schema version would use `/lish/catalog-sync/2.0.0`. Peers negotiate the highest common version during handshake.
+Structurally required fields are defined in schema version 1 and **never change**. New fields can be at most functionally required, and only after a transition period as optional.
 
-**CBOR forward compatibility**: Unknown fields in CBOR are preserved during decode (unlike strict JSON parsers). An old peer receiving a new-format entry will store and forward the unknown fields without losing them — natural forward compatibility.
+**Adding a new optional field** (backward compatible):
 
-**GossipSub topic**: The gossipsub topic (`lish/<networkID>`) does NOT include a version. Message format is identified by a `version` field in the JSON payload. Old peers ignore messages with unknown versions (IGNORE, not REJECT — no penalty for new-format messages).
+```
+Release v2.0:
+  CatalogEntry { ..., license?: string }
+
+  New peer: fills license on all new entries
+  Old peer: doesn't fill it, but doesn't crash (field is optional)
+  Sync works normally — old peers store and forward unknown fields via CBOR
+```
+
+**Promoting optional → functionally required** (three-phase migration):
+
+A field cannot go from "doesn't exist" to "required" in one step — old peers would create entries without it, and new peers would reject them. Instead:
+
+```
+Phase 1 — v2.0: add as optional
+  CatalogEntry { ..., language?: string }
+  UI offers language selection when publishing
+  Backend accepts entries with or without language
+  Old peers ignore the field, store and forward it via CBOR
+
+Phase 2 — v2.1: UI requires it, backend still tolerates missing
+  UI form validation: language is mandatory (cannot publish without it)
+  Backend still accepts entries without language (from old peers)
+  Most new entries in the network now have language filled
+
+Phase 3 — v3.0: backend requires it for NEW entries
+  Backend rejects NEW entries without language (REJECT at validation)
+  Backend ACCEPTS old entries without language (migration exception)
+  Old entries display as "(language not specified)" in UI
+  Old entries are never invalidated — they have valid signatures from their era
+```
+
+```typescript
+// Phase 3 validation logic
+function validateEntry(entry: CatalogEntry, isNewEntry: boolean): boolean {
+  if (isNewEntry) {
+    // New entries: functionally required fields must be present
+    if (!entry.language) return false;
+  }
+  // Existing entries: tolerate missing functionally-required fields
+  // They were valid when created — never retroactively invalidate
+  return true;
+}
+```
+
+**Why never retroactively invalidate:**
+
+In a P2P system, entries are signed at creation time. The signature proves the entry passed validation **at that time**. Retroactively requiring a field would:
+1. Invalidate entries that peers have been faithfully storing and forwarding
+2. Cause catalog divergence — new peers reject entries that old peers accept
+3. Break the trust model — signatures should mean "this was valid"
+
+**Schema version changes** (breaking, non-additive):
+
+| Change type | Strategy | Example |
+|---|---|---|
+| New optional field | Backward compatible, no version bump | Adding `license?: string` |
+| Optional → functionally required | Three-phase migration (see above) | `language` becomes required for new entries |
+| Field type change | New schema version + migration code | `totalSize: string` → `totalSize: number` |
+| Field removal | Deprecate in vN, stop writing in vN+1, ignore in vN+2 | Remove `checksumAlgo` |
+| Structural change | New protocol version `/lish/catalog-sync/2.0.0` | Changing CatalogEntry identity model |
+
+**Wire protocol versioning**: The bilateral sync protocol includes a version in its path (`/lish/catalog-sync/1.0.0`). A structural schema change would use `/lish/catalog-sync/2.0.0`. Peers negotiate the highest common version during handshake. If no common version exists, sync falls back to the older protocol.
+
+**CBOR forward compatibility**: Unknown fields in CBOR are preserved during decode (unlike strict JSON parsers). An old peer receiving a new-format entry will store and forward the unknown fields without losing them — natural forward compatibility. This is what makes Phase 1 (add as optional) work seamlessly.
+
+**GossipSub topic**: The gossipsub topic (`lish/<networkID>`) does NOT include a version. Message format is identified by a `version` field in the JSON payload. Old peers ignore messages with unknown versions (IGNORE, not REJECT — no penalty for new-format messages from newer peers).
