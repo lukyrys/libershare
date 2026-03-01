@@ -1994,3 +1994,460 @@ class CatalogCRDT {
 ```
 
 Maximum one disk write per 500ms regardless of incoming operation rate. On shutdown, `flush()` is called to ensure no data loss.
+
+---
+
+## 16. Open Design Questions — End-to-End Integration (Resolved)
+
+Analysis of shared types (`shared/src/lish.ts`, `shared/src/index.ts`), API server pattern (`api/server.ts`), frontend Products page (`Products.svelte`), and DataServer reveals these remaining integration gaps.
+
+### 16.1 ILISH → CatalogEntry Field Mapping
+
+The publish flow (section 15.5) extracts CatalogEntry fields from ILISH. The exact mapping must account for optional fields in the ILISH interface:
+
+```typescript
+// shared/src/lish.ts — actual interface
+interface ILISH {
+  version: number;
+  id: string;
+  name?: string;         // optional — may be undefined
+  description?: string;  // optional — may be undefined
+  created: string;       // ISO 8601
+  chunkSize: number;
+  checksumAlgo: HashAlgorithm;  // 'sha256' | 'xxhash' etc.
+  directories?: IDirectoryEntry[];
+  files?: IFileEntry[];   // optional — may be undefined for metadata-only LISHs
+  links?: ILinkEntry[];
+}
+
+interface IFileEntry {
+  path: string;
+  size: number;
+  checksums: string[];   // per-chunk hashes
+  // ... permissions, modified, created
+}
+```
+
+**Mapping to CatalogEntry**:
+
+```typescript
+function lishToCatalogEntry(lish: IStoredLISH, publisherPeerID: string): Omit<CatalogEntry, 'hlc' | 'signature'> {
+  const files = lish.files ?? [];
+  return {
+    // Immutable identity fields
+    lishID: lish.id,
+    publisherPeerID,
+    publishedAt: new Date().toISOString(),
+    chunkSize: lish.chunkSize,
+    checksumAlgo: lish.checksumAlgo,
+    fileCount: files.length,
+    totalSize: files.reduce((sum, f) => sum + f.size, 0),
+    manifestHash: sha256(canonicalize(lish)),
+
+    // Editable metadata (copied from LISH, can be edited later by any moderator)
+    name: lish.name,           // undefined if not set — UI shows lishID as fallback
+    description: lish.description,
+  };
+}
+```
+
+**Validation before publish**:
+- `lish.files` must be defined and non-empty (can't catalog an empty LISH)
+- `lish.chunkSize` must be > 0
+- `lish.id` must be a valid UUID
+- `totalSize` must be > 0
+
+**Fields NOT copied from ILISH**: `directories`, `links`, `version`, `created` (LISH creation date is separate from catalog publish date). The full manifest is fetched on demand via `get_lish_req`.
+
+### 16.2 Catalog Listing Pagination
+
+`catalog.list(networkID)` returning all entries is fine for small catalogs but becomes a problem at scale (50K entries = ~25 MB JSON over WebSocket).
+
+**Decision: Cursor-based pagination.**
+
+```typescript
+// API
+catalog.list(networkID, { limit?: number, cursor?: string, sort?: 'newest' | 'oldest' | 'name' })
+  → { entries: CatalogEntry[], cursor: string | null, total: number }
+
+// Default: limit=100, sort='newest' (by HLC, most recent first)
+// cursor is the lishID of the last item in the previous page
+// cursor=null means no more pages
+```
+
+**Implementation** (in-memory, Phase 1):
+
+```typescript
+function paginatedList(
+  entries: Map<string, CatalogEntry>,
+  opts: { limit: number; cursor?: string; sort: 'newest' | 'oldest' | 'name' }
+): { entries: CatalogEntry[]; cursor: string | null; total: number } {
+  let sorted = [...entries.values()];
+
+  // Sort
+  switch (opts.sort) {
+    case 'newest': sorted.sort((a, b) => hlcCompare(b.hlc, a.hlc)); break;
+    case 'oldest': sorted.sort((a, b) => hlcCompare(a.hlc, b.hlc)); break;
+    case 'name': sorted.sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '')); break;
+  }
+
+  // Cursor: find start position
+  let startIdx = 0;
+  if (opts.cursor) {
+    const idx = sorted.findIndex(e => e.lishID === opts.cursor);
+    if (idx >= 0) startIdx = idx + 1;
+  }
+
+  const page = sorted.slice(startIdx, startIdx + opts.limit);
+  const hasMore = startIdx + opts.limit < sorted.length;
+
+  return {
+    entries: page,
+    cursor: hasMore ? page[page.length - 1]!.lishID : null,
+    total: sorted.length,
+  };
+}
+```
+
+**Frontend**: Products page loads first 100 entries, then loads more on scroll (infinite scroll pattern matching the existing grid layout).
+
+### 16.3 Sync Triggers — When Does Bilateral Sync Fire?
+
+The document describes bilateral sync but never specifies **when** it runs.
+
+**Decision: Three trigger mechanisms.**
+
+```
+1. On join (immediate):
+   When a peer joins a network (setEnabled → catalogManager.join):
+   - Wait 1-5s random jitter (thundering herd prevention)
+   - Pick random connected peer from topic subscribers
+   - Run full bilateral sync
+   - If delta > 100 entries, repeat with a different peer for cross-validation
+
+2. Periodic anti-entropy (background):
+   Every 60 seconds per joined network:
+   - If any peers available, pick one at random
+   - Exchange vector summaries (cheap — just HLC map)
+   - If summaries differ, run delta sync
+   - This catches any GossipSub messages lost silently
+
+3. On peer discovery (opportunistic):
+   When a new peer connects to the topic (gossipsub:graft event):
+   - Wait 2-5s (let the peer stabilize)
+   - If our catalog is empty or our vectorClock has gaps, trigger sync
+   - Otherwise skip (periodic anti-entropy will catch it)
+```
+
+**Sync manager** (per CatalogCRDT):
+
+```typescript
+class CatalogCRDT {
+  private antiEntropyTimer: Timer | null = null;
+
+  startAntiEntropy(): void {
+    this.antiEntropyTimer = setInterval(() => {
+      this.trySync();
+    }, 60_000 + Math.random() * 10_000);  // 60-70s jitter
+  }
+
+  stopAntiEntropy(): void {
+    if (this.antiEntropyTimer) clearInterval(this.antiEntropyTimer);
+    this.antiEntropyTimer = null;
+  }
+
+  private async trySync(): Promise<void> {
+    const peers = this.network.getTopicPeers(this.networkID);
+    if (peers.length === 0) return;
+
+    // Pick random peer
+    const peer = peers[Math.floor(Math.random() * peers.length)]!;
+    await this.bilateralSync(peer);
+  }
+}
+```
+
+### 16.4 Cross-Network Replay Prevention
+
+A valid signed operation from network A could be replayed on network B. The `SignedCatalogOp.payload.networkID` field exists for this purpose, but section 4.4's `validateOperation()` doesn't check it.
+
+**Decision: Add networkID check to validation.**
+
+```typescript
+// Addition to validateOperation() in section 4.4
+function validateOperation(op: SignedCatalogOp, currentACL: ICatalogAccess, expectedNetworkID: string): ValidationResult {
+  // 0. Check networkID matches (cross-network replay prevention)
+  if (op.payload.networkID !== expectedNetworkID) {
+    return { valid: false, reason: 'NETWORK_ID_MISMATCH' };
+  }
+
+  // 1. Verify Ed25519 signature (existing)
+  // ...
+}
+```
+
+The `networkID` is part of the signed `CatalogOpPayload`, so it cannot be tampered with. A valid operation from network A will have `networkID: "A"` baked into the signature. Replaying it on network B fails because `op.payload.networkID !== "B"`.
+
+### 16.5 Shared Types for Frontend
+
+The frontend needs CatalogEntry, ICatalogAccess, and related types. These must be in `shared/src/` (the existing shared package used by both backend and frontend).
+
+**New file**: `shared/src/catalog.ts`
+
+```typescript
+// shared/src/catalog.ts
+
+export interface HLC {
+  wallTime: number;
+  logical: number;
+  nodeID: string;
+}
+
+export interface CatalogEntry {
+  // Immutable fields
+  lishID: string;
+  publisherPeerID: string;
+  publishedAt: string;
+  chunkSize: number;
+  checksumAlgo: string;
+  fileCount: number;
+  totalSize: number;
+  manifestHash?: string;
+
+  // Editable metadata
+  name?: string;
+  description?: string;
+  contentType?: 'software' | 'media' | 'document' | 'dataset' | 'archive' | 'other';
+  tags?: string[];
+
+  // System fields
+  hlc: HLC;
+  signature: string;
+  lastEditedBy?: string;
+}
+
+export interface ICatalogAccess {
+  owner: string;
+  admins: string[];
+  moderators: string[];
+  restrictCatalogWrites: boolean;
+}
+
+export interface CatalogSyncStatus {
+  entryCount: number;
+  tombstoneCount: number;
+  lastSyncAt: string | null;
+  peers: number;
+}
+
+export interface CatalogListResult {
+  entries: CatalogEntry[];
+  cursor: string | null;
+  total: number;
+}
+
+export type ContentType = CatalogEntry['contentType'];
+```
+
+**Re-export from `shared/src/index.ts`**:
+
+```typescript
+export type { CatalogEntry, ICatalogAccess, CatalogSyncStatus, CatalogListResult, HLC, ContentType } from './catalog.ts';
+```
+
+### 16.6 API Handler Registration Pattern
+
+The API server uses a handler init pattern. The catalog needs a new handler file following the same convention:
+
+```typescript
+// backend/src/api/catalog.ts
+
+import { type CatalogManager } from '../catalog/catalog-manager.ts';
+import { type Networks } from '../lishnet/networks.ts';
+import { type DataServer } from '../lish/data-server.ts';
+import { Utils } from '../utils.ts';
+const assert = Utils.assertParams;
+
+interface CatalogHandlers {
+  list: (p: { networkID: string; limit?: number; cursor?: string; sort?: string }) => CatalogListResult;
+  get: (p: { networkID: string; lishID: string }) => CatalogEntry | null;
+  search: (p: { networkID: string; query: string }) => CatalogEntry[];
+  publish: (p: { networkID: string; lishID: string }) => Promise<void>;
+  update: (p: { networkID: string; lishID: string; fields: Record<string, any> }) => Promise<void>;
+  remove: (p: { networkID: string; lishID: string }) => Promise<void>;
+  getAccess: (p: { networkID: string }) => ICatalogAccess;
+  updateAccess: (p: { networkID: string; changes: any }) => Promise<void>;
+  getSyncStatus: (p: { networkID: string }) => CatalogSyncStatus;
+}
+
+export function initCatalogHandlers(
+  catalogManager: CatalogManager,
+  networks: Networks,
+  dataServer: DataServer
+): CatalogHandlers {
+  function getCatalog(networkID: string): CatalogCRDT {
+    const crdt = catalogManager.get(networkID);
+    if (!crdt) throw new Error('Catalog not available for this network');
+    return crdt;
+  }
+
+  return {
+    list(p) {
+      assert(p, ['networkID']);
+      return getCatalog(p.networkID).list({
+        limit: p.limit ?? 100,
+        cursor: p.cursor,
+        sort: (p.sort as any) ?? 'newest',
+      });
+    },
+    get(p) {
+      assert(p, ['networkID', 'lishID']);
+      return getCatalog(p.networkID).getEntry(p.lishID);
+    },
+    search(p) {
+      assert(p, ['networkID', 'query']);
+      return getCatalog(p.networkID).search(p.query);
+    },
+    async publish(p) {
+      assert(p, ['networkID', 'lishID']);
+      const lish = dataServer.get(p.lishID);
+      if (!lish) throw new Error('LISH not found locally');
+      if (!lish.files?.length) throw new Error('LISH has no files');
+      await getCatalog(p.networkID).publish(lish);
+    },
+    async update(p) {
+      assert(p, ['networkID', 'lishID', 'fields']);
+      await getCatalog(p.networkID).updateEntry(p.lishID, p.fields);
+    },
+    async remove(p) {
+      assert(p, ['networkID', 'lishID']);
+      await getCatalog(p.networkID).removeEntry(p.lishID);
+    },
+    getAccess(p) {
+      assert(p, ['networkID']);
+      return getCatalog(p.networkID).getAccess();
+    },
+    async updateAccess(p) {
+      assert(p, ['networkID', 'changes']);
+      await getCatalog(p.networkID).updateAccess(p.changes);
+    },
+    getSyncStatus(p) {
+      assert(p, ['networkID']);
+      return getCatalog(p.networkID).getSyncStatus();
+    },
+  };
+}
+```
+
+**Registration in `server.ts`** (following existing pattern):
+
+```typescript
+const _catalog = initCatalogHandlers(catalogManager, this.networks, this.dataServer);
+
+this.handlers = {
+  // ... existing handlers ...
+
+  // Catalog
+  'catalog.list': _catalog.list,
+  'catalog.get': _catalog.get,
+  'catalog.search': _catalog.search,
+  'catalog.publish': _catalog.publish,
+  'catalog.update': _catalog.update,
+  'catalog.remove': _catalog.remove,
+  'catalog.getAccess': _catalog.getAccess,
+  'catalog.updateAccess': _catalog.updateAccess,
+  'catalog.getSyncStatus': _catalog.getSyncStatus,
+};
+```
+
+**CatalogManager injection**: `APIServer` constructor receives `CatalogManager` as a new parameter. Created in `app.ts` alongside `Networks`.
+
+### 16.7 Frontend Products Page Redesign
+
+The current `Products.svelte` has 200 hardcoded items. Full redesign needed:
+
+**Current state** (to be replaced):
+```typescript
+const items = Array.from({ length: 200 }, (_, i) => ({ id: i + 1, title: 'Item ' + (i + 1) }));
+```
+
+**New data flow**:
+
+```
+1. Products page receives networkID prop (selected in sidebar/header)
+2. On mount: call api.catalog.list(networkID, { limit: 100 })
+3. Display entries in existing grid layout (reuse ProductsItem component)
+4. Infinite scroll: on scroll near bottom, load next page via cursor
+5. Search: call api.catalog.search(networkID, query) on search input
+6. Live updates: subscribe to catalog:updated / catalog:removed events
+7. Moderator actions: publish button (if user has moderator+ role), edit metadata, remove
+```
+
+**ProductsItem changes**:
+
+```
+Current props: { title: string, image: string, isGamepadHovered, isAPressed }
+New props:     { entry: CatalogEntry, isGamepadHovered, isAPressed }
+
+Display:
+- entry.name ?? entry.lishID (truncated UUID)
+- entry.totalSize → human-readable (e.g., "4.8 GB")
+- entry.fileCount → "12 files"
+- entry.contentType → icon/badge
+- entry.tags → tag chips
+- entry.publishedAt → relative time ("2 days ago")
+- No real image yet — use contentType-based placeholder icon
+```
+
+**Product detail (Product.svelte) changes**:
+
+```
+On select: Product component receives CatalogEntry
+- Show full metadata (name, description, publisher, size, files, tags)
+- "Download" button → triggers transfer.download(networkID, lishID)
+- "Edit" button (if moderator+) → opens metadata edit form
+- "Remove" button (if moderator+) → confirms and calls catalog.remove
+- Fetch full LISH manifest on demand for file listing: api.lishs.get(lishID)
+```
+
+### 16.8 File Structure — Planned Backend Modules
+
+Summary of all new files needed for implementation:
+
+```
+shared/src/
+├── catalog.ts              (NEW: CatalogEntry, ICatalogAccess, HLC, CatalogListResult)
+├── index.ts                (EDIT: re-export catalog types, add ownerPeerID to ILISHNetwork)
+└── lish.ts                 (existing, unchanged)
+
+backend/src/
+├── catalog/
+│   ├── catalog-crdt.ts     (NEW: CatalogCRDT class — core CRDT logic, merge, validation)
+│   ├── catalog-hlc.ts      (NEW: HLC implementation — tick, merge, compare)
+│   ├── catalog-signer.ts   (NEW: signCatalogOp, verifyCatalogOp — Ed25519 signing)
+│   ├── catalog-persistence.ts (NEW: saveCatalog, loadCatalog — CBOR with crash safety)
+│   ├── catalog-manager.ts  (NEW: CatalogManager — multi-lishnet lifecycle)
+│   ├── catalog-search.ts   (NEW: searchCatalog — in-memory filtering with relevance)
+│   └── catalog-sync.ts     (NEW: bilateral sync stream handler + initiator)
+├── api/
+│   ├── catalog.ts          (NEW: initCatalogHandlers — WebSocket API)
+│   └── server.ts           (EDIT: register catalog handlers, inject CatalogManager)
+├── protocol/
+│   ├── network.ts          (EDIT: add getPrivateKey(), registerStreamHandler())
+│   └── network-config.ts   (EDIT: future — upgrade gossipsub D to >=6, add peer scoring)
+├── lishnet/
+│   └── networks.ts         (EDIT: call catalogManager.join/leave on setEnabled)
+└── app.ts                  (EDIT: create CatalogManager, pass to APIServer)
+
+frontend/src/
+├── pages/Products/
+│   ├── Products.svelte     (REWRITE: API-driven catalog grid with pagination)
+│   └── ProductsItem.svelte (EDIT: accept CatalogEntry prop instead of title/image)
+├── pages/Product/
+│   └── Product.svelte      (EDIT: show CatalogEntry details, download/edit/remove actions)
+└── scripts/
+    └── catalog.ts          (NEW: catalog API client wrapper, event subscriptions)
+```
+
+**Total new files**: 9 backend + 1 shared + 1 frontend script = 11 new files
+**Total edited files**: 6 (server.ts, network.ts, networks.ts, app.ts, Products.svelte, ProductsItem.svelte, shared/index.ts)
