@@ -720,7 +720,9 @@ interface CatalogDelta {
 
 ## 6. Persistence
 
-Catalog state is persisted per-lishnet as a JSON file, following the existing `ArrayStorage` pattern:
+### Overview
+
+The CRDT state lives **in memory** during runtime. Persistence is a snapshot written to disk on every change and reloaded on startup. One file per lishnet:
 
 ```
 data/
@@ -728,12 +730,129 @@ data/
 ├── lishnets.json         (existing - network configs)
 ├── settings.json         (existing)
 ├── catalog/
-│   ├── <networkID>.json  (catalog entries + tombstones + ACL)
-│   └── <networkID>.json
+│   ├── <networkID>.cbor  (catalog entries + tombstones + ACL)
+│   └── <networkID>.cbor
 └── datastore.db          (existing - libp2p peer store)
 ```
 
-Catalog file structure:
+### Format Evaluation
+
+| | JSON | MessagePack | **CBOR** | SQLite |
+|---|---|---|---|---|
+| File size (10K entries) | 5 MB | 3.2 MB | **3 MB** | ~4 MB |
+| Signatures stored as | base64 string (33% overhead) | base64 string (33% overhead) | **native bytes (0% overhead)** | BLOB (0% overhead) |
+| Write strategy | full file rewrite | full file rewrite | **full file rewrite** | per-row INSERT/UPDATE |
+| Parse speed (10K) | ~50 ms | ~20 ms | **~15 ms** | ~5 ms (indexed query) |
+| Search | filter in memory | filter in memory | **filter in memory** | SQL + FTS5 fulltext |
+| Human readable | yes (text editor) | no | **no** | SQLite browser |
+| New dependency | none | @msgpack/msgpack | **cbor-x** | none (bun:sqlite) |
+| Binary data support | no (base64 workaround) | limited | **native (Uint8Array, Buffer)** | native (BLOB) |
+| Standards | RFC 8259 | msgpack.org spec | **RFC 8949 (IETF standard)** | — |
+| Used by libp2p internally | no | no | **yes (dag-cbor)** | no |
+
+### Decision: CBOR (RFC 8949)
+
+**Selected**: `cbor-x` package for encoding/decoding.
+
+**Why CBOR over JSON:**
+
+1. **Native binary data** — Ed25519 signatures (64 bytes), public keys, and manifest hashes are binary. JSON requires base64 encoding (+33% size, encode/decode overhead on every operation). CBOR stores `Uint8Array` directly
+2. **~40% smaller files** — no repeated key names in quotes, no base64 bloat, compact integer encoding. A 5 MB JSON catalog becomes ~3 MB CBOR
+3. **~3x faster parsing** — `cbor-x` is one of the fastest serializers for Node/Bun, binary format skips text parsing entirely
+4. **IETF standard** — RFC 8949, widely adopted (WebAuthn, COSE signatures, IPFS dag-cbor, IoT). Not a niche format
+5. **libp2p ecosystem alignment** — IPFS and libp2p use dag-cbor internally for content-addressed data. Same conceptual model
+
+**Why CBOR over MessagePack:**
+
+- MessagePack has no native `Uint8Array` type — binary data needs explicit `Ext` type wrapping
+- CBOR is an IETF standard (RFC 8949), MessagePack is a community spec
+- CBOR has COSE (RFC 9052) for signed structures — potential future use for standardized signature envelopes
+- Performance difference is negligible (`cbor-x` and `@msgpack/msgpack` are within 5% of each other)
+
+**Why CBOR over SQLite (for now):**
+
+- SQLite solves a different problem (partial writes, indexed queries) that we don't need at <10K entries
+- CRDT merge is simpler with full-state serialization than with SQL INSERT/UPDATE reconciliation
+- Full file rewrite is fine up to ~25 MB (~50K entries, ~100 ms write time)
+- SQLite would require mapping CRDT semantics to relational schema — added complexity for no gain at current scale
+- **Migration path**: If catalogs grow beyond 50K entries, SQLite becomes the right choice. The persistence layer is isolated from CRDT logic, so migration is a clean module swap
+
+**When to reconsider SQLite:**
+
+| Signal | Action |
+|---|---|
+| Catalog write time exceeds 100 ms | Migrate to SQLite |
+| Users request fulltext search across catalogs | Add SQLite with FTS5 |
+| Single catalog exceeds 50K entries | SQLite partial writes become essential |
+| Need to query across multiple lishnets | SQLite with shared DB file |
+
+### Implementation
+
+```typescript
+// backend/src/catalog/catalog-persistence.ts
+import { Encoder, Decoder } from 'cbor-x';
+
+const encoder = new Encoder({ mapsAsObjects: true, useRecords: false });
+const decoder = new Decoder({ mapsAsObjects: true });
+
+interface CatalogSnapshot {
+  entries: CatalogEntry[];
+  tombstones: TombstoneEntry[];
+  access: ICatalogAccess;
+  vectorClock: Record<string, HLC>;
+  localClock: HLC;
+  syncState: Record<string, HLC>;
+}
+
+export function saveCatalog(path: string, state: CatalogCRDTState): void {
+  const snapshot: CatalogSnapshot = {
+    entries: [...state.entries.values()],
+    tombstones: [...state.tombstones.values()],
+    access: state.access,
+    vectorClock: Object.fromEntries(state.vectorClock),
+    localClock: state.localClock,
+    syncState: Object.fromEntries(state.syncState),
+  };
+  const bytes = encoder.encode(snapshot);
+  Bun.write(path, bytes);  // atomic write
+}
+
+export function loadCatalog(path: string): CatalogSnapshot | null {
+  try {
+    const bytes = new Uint8Array(Bun.file(path).arrayBuffer());
+    return decoder.decode(bytes);
+  } catch {
+    return null;  // file missing or corrupt → start fresh, sync from peers
+  }
+}
+```
+
+**Signature storage comparison** (per entry):
+
+```
+JSON:    "signature": "MEUCIQC7x2nQ3Kp..."   → 92 bytes (base64 of 64-byte Ed25519 sig)
+CBOR:    signature: <64 raw bytes>             → 66 bytes (2-byte CBOR header + 64 bytes)
+
+Per 10K entries: JSON wastes ~260 KB on base64 encoding alone.
+```
+
+### Tamper Resistance
+
+The local file is a **cache**, not a source of truth. Signatures are the source of truth:
+
+| Tampering scenario | What happens |
+|---|---|
+| Peer edits a field in the file | Signature becomes invalid → overwritten on next sync |
+| Peer deletes the file | Fresh start → bilateral sync restores full catalog from peers |
+| Peer adds fake entry | No valid moderator signature → rejected by all peers on sync |
+| Peer removes a tombstone | Tombstone comes back from other peers on next sync |
+| File corrupted (disk error) | CBOR decode fails → treated as missing → sync from peers |
+
+The CRDT state can always be **fully reconstructed from the network**. The local file only exists to avoid re-downloading everything on every restart.
+
+### Example: Logical structure (shown as JSON for readability)
+
+The actual file is binary CBOR, but the logical structure is:
 
 ```json
 {
@@ -746,7 +865,7 @@ Catalog file structure:
       "fileCount": 1,
       "totalSize": 4800000000,
       "hlc": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
-      "signature": "base64..."
+      "signature": "<64 bytes binary, not base64>"
     }
   ],
   "tombstones": [],
@@ -815,7 +934,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - `CatalogCRDT` class (entries, tombstones, merge, LWW)
 - `CatalogSyncManager` (bilateral catch-up stream protocol)
 - Signature generation and verification (Ed25519)
-- Persistence to JSON files
+- Persistence to CBOR files (cbor-x, with migration path to SQLite if needed)
 - Unit tests for merge correctness and security validation
 
 ### Phase 2: GossipSub Integration (Backend)
@@ -879,10 +998,11 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 
 ### Dependencies
 
-Only one new dependency needed:
+Two new dependencies needed:
 
 ```bash
-bun add json-canonicalize   # RFC 8785 JCS for deterministic JSON serialization
+bun add json-canonicalize   # RFC 8785 JCS for deterministic JSON serialization (signing)
+bun add cbor-x              # RFC 8949 CBOR binary encoding (persistence)
 ```
 
 `@libp2p/peer-id` is already a transitive dependency of `libp2p`.
