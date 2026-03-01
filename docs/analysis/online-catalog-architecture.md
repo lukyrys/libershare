@@ -100,20 +100,26 @@ See section 4.5 for the full HLC implementation (tick, merge, compare).
 
 ```typescript
 interface CatalogEntry {
+  // === Immutable fields (set on creation, never changed) ===
   lishID: string;              // UUID - immutable key
-  name?: string;               // Human-readable name
-  description?: string;        // Optional description
-  publisherPeerID: string;     // Who published this entry
-  publishedAt: string;         // ISO 8601 timestamp
+  publisherPeerID: string;     // Who originally published this entry
+  publishedAt: string;         // ISO 8601 timestamp of first publish
   chunkSize: number;           // From LISH manifest
   checksumAlgo: string;        // From LISH manifest
   fileCount: number;           // Derived from LISH
   totalSize: number;           // Derived from LISH (bytes)
-  hlc: HLC;                   // Hybrid Logical Clock for LWW ordering
-  signature: string;           // Ed25519 signature (see Security)
+  manifestHash?: string;       // SHA256 of LISH manifest for integrity
+
+  // === Editable metadata (any moderator+ can update) ===
+  name?: string;               // Human-readable name
+  description?: string;        // Optional description
   contentType?: 'software' | 'media' | 'document' | 'dataset' | 'archive' | 'other';
   tags?: string[];             // max 10 tags, max 32 chars each, lowercase
-  manifestHash?: string;       // SHA256 of LISH manifest for integrity
+
+  // === System fields (updated automatically) ===
+  hlc: HLC;                   // Hybrid Logical Clock for LWW ordering
+  signature: string;           // Ed25519 signature of current state
+  lastEditedBy?: string;       // PeerID of last editor (undefined = never edited after creation)
 }
 ```
 
@@ -195,15 +201,26 @@ libp2p already provides this. Each peer has an Ed25519 keypair:
 
 #### 4.2 Signed Operations (Every Write is Signed)
 
-Every catalog operation (add, remove, ACL change) MUST include an Ed25519 signature from the author's private key. Receiving peers verify the signature before applying the operation.
+Every catalog operation (add, update, remove, ACL change) MUST include an Ed25519 signature from the author's private key. Receiving peers verify the signature before applying the operation.
 
 ```typescript
 interface SignedOperation {
-  op: 'add' | 'remove' | 'acl_grant' | 'acl_revoke';
-  payload: CatalogEntry | TombstoneEntry | ACLChange;
+  op: 'add' | 'update' | 'remove' | 'acl_grant' | 'acl_revoke';
+  payload: CatalogEntry | CatalogUpdate | TombstoneEntry | ACLChange;
   authorPeerID: string;        // Who created this operation
   hlc: HLC;                   // Hybrid Logical Clock (monotonically increasing per author)
   signature: string;           // Ed25519 sign(payload + authorPeerID + hlc)
+}
+
+// Partial update of editable metadata fields
+interface CatalogUpdate {
+  lishID: string;              // Which entry to update
+  fields: {
+    name?: string;
+    description?: string;
+    contentType?: CatalogEntry['contentType'];
+    tags?: string[];
+  };
 }
 
 interface ACLChange {
@@ -229,6 +246,7 @@ Trust chain:
   Owner --signs--> "PeerID_X is admin"     (ACL operation, signed by owner)
   Admin  --signs--> "PeerID_Y is moderator" (ACL operation, signed by admin)
   Moderator --signs--> "add LISH Z"         (catalog operation, signed by moderator)
+  Moderator --signs--> "update LISH Z name" (metadata edit, any moderator+ can edit any entry)
 ```
 
 Every peer can verify the full chain:
@@ -256,6 +274,19 @@ function validateOperation(op: SignedOperation, currentACL: ICatalogAccess): Val
         if (!isOwnerOrAdminOrModerator(op.authorPeerID, currentACL)) {
           return { valid: false, reason: 'UNAUTHORIZED_ADD' };
         }
+      }
+      break;
+
+    case 'update':
+      // Only owner/admin/moderator can edit metadata (regardless of restrictCatalogWrites)
+      if (!isOwnerOrAdminOrModerator(op.authorPeerID, currentACL)) {
+        return { valid: false, reason: 'UNAUTHORIZED_UPDATE' };
+      }
+      // Verify only editable fields are being changed
+      const update = op.payload as CatalogUpdate;
+      const allowedFields = ['name', 'description', 'contentType', 'tags'];
+      if (Object.keys(update.fields).some(k => !allowedFields.includes(k))) {
+        return { valid: false, reason: 'IMMUTABLE_FIELD_UPDATE' };
       }
       break;
 
@@ -549,6 +580,17 @@ For live operations while peers are connected. Messages are small JSON payloads 
   signature: string
 }
 
+// Update metadata of existing LISH (any moderator+ can edit any entry)
+{
+  type: 'catalog_op',
+  op: 'update',
+  lishID: string,
+  fields: { name?, description?, contentType?, tags? },
+  authorPeerID: string,
+  hlc: HLC,
+  signature: string
+}
+
 // Remove a LISH from catalog
 {
   type: 'catalog_op',
@@ -736,6 +778,7 @@ catalog.list(networkID)                        → CatalogEntry[]
 catalog.get(networkID, lishID)                 → CatalogEntry | null
 catalog.search(networkID, query)               → CatalogEntry[]
 catalog.publish(networkID, lishID)             → void  (broadcast add)
+catalog.update(networkID, lishID, fields)      → void  (broadcast update, moderator+)
 catalog.remove(networkID, lishID)              → void  (broadcast remove)
 catalog.getAccess(networkID)                   → ICatalogAccess
 catalog.updateAccess(networkID, changes)       → void  (broadcast ACL change)
@@ -826,6 +869,9 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Anti-escalation rule: cannot grant permissions you do not hold (Matrix Rule 9)
 - [ ] Power-events-first ordering: ACL events processed before catalog events in same batch
 - [ ] Cascading revocation: revoking admin invalidates all their granted moderator permissions
+- [ ] Update operations: only editable fields (name, description, contentType, tags) can be changed
+- [ ] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
+- [ ] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
 
 ---
 
@@ -852,7 +898,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import type { Ed25519PrivateKey } from '@libp2p/interface';
 
 export interface CatalogOpPayload {
-  type: 'add' | 'remove' | 'acl_grant' | 'acl_revoke';
+  type: 'add' | 'update' | 'remove' | 'acl_grant' | 'acl_revoke';
   networkID: string;
   hlc: HLC;                // Hybrid Logical Clock
   nonce: string;           // crypto.randomUUID() for uniqueness
