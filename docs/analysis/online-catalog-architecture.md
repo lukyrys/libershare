@@ -1,6 +1,6 @@
 # LiberShare Online Catalog (DB LISHs) - Architecture Analysis
 
-**Date**: 2026-02-28 (updated 2026-03-01)
+**Date**: 2026-02-28 (updated 2026-03-10)
 **Branch**: `feat/online-db`
 **Status**: Complete — ready for Phase 1 implementation
 **Author**: Analysis by Claude, discussed with Jiri Kreibich
@@ -392,8 +392,9 @@ function hlcMerge(local: HLC, remote: HLC): HLC {
 **Why HLC over pure Lamport clocks**:
 - **Wall-clock correlation**: Operations within the same second get meaningful timestamps (useful for "published at" display)
 - **Clock skew tolerance**: `max()` operation absorbs up to ~1 minute of clock drift
-- **Bounded drift**: If `wallTime` diverges from real time by > MAX_DRIFT (60s), reject the operation — prevents time-travel attacks
+- **Bounded drift**: If `wallTime` diverges from real time by > MAX_DRIFT (5 minutes), reject the operation — prevents time-travel attacks where a peer sets their clock far into the future to always win LWW
 - **Same anti-replay**: Each operation's HLC must be strictly greater than the last seen from that author
+- **Deterministic tiebreaking**: When `wallTime` AND `logical` are equal (extremely rare — two peers, same millisecond, same operation), `nodeID` (PeerID string comparison) provides the final tiebreaker. This ensures all peers reach the same LWW outcome without coordination
 
 **Per-author tracking** (vector clock of HLCs):
 
@@ -712,187 +713,236 @@ interface CatalogDelta {
 
 ### Overview
 
-The CRDT state lives **in memory** during runtime. Persistence is a snapshot written to disk on every change and reloaded on startup. One file per lishnet:
+The catalog CRDT state lives **in SQLite** (`libershare.db`), the same database already used for LISHs and lishnets storage. No separate files, no in-memory Maps. The 2P-Set CRDT maps naturally to SQL tables — LWW merge is a single `INSERT ON CONFLICT DO UPDATE WHERE` comparing HLC values.
 
 ```
 data/
-├── libershare.db         (existing - LISHs + LISHnets, bun:sqlite with WAL)
+├── libershare.db         (existing - LISHs + LISHnets + catalog tables, bun:sqlite with WAL)
 ├── settings.json         (existing)
-├── catalog/
-│   ├── <networkID>.cbor  (catalog entries + tombstones + ACL)
-│   └── <networkID>.cbor
 └── datastore.db          (existing - libp2p peer store, separate from app DB)
 ```
 
-### Format Evaluation
+### Why SQLite (not CBOR files)
 
-| | JSON | MessagePack | **CBOR** | SQLite |
-|---|---|---|---|---|
-| File size (10K entries) | 5 MB | 3.2 MB | **3 MB** | ~4 MB |
-| Signatures stored as | base64 string (33% overhead) | base64 string (33% overhead) | **native bytes (0% overhead)** | BLOB (0% overhead) |
-| Write strategy | full file rewrite | full file rewrite | **full file rewrite** | per-row INSERT/UPDATE |
-| Parse speed (10K) | ~50 ms | ~20 ms | **~15 ms** | ~5 ms (indexed query) |
-| Search | filter in memory | filter in memory | **filter in memory** | SQL + FTS5 fulltext |
-| Human readable | yes (text editor) | no | **no** | SQLite browser |
-| New dependency | none | @msgpack/msgpack | **cbor-x** | none (bun:sqlite, already used) |
-| Binary data support | no (base64 workaround) | limited | **native (Uint8Array, Buffer)** | native (BLOB) |
-| Standards | RFC 8259 | msgpack.org spec | **RFC 8949 (IETF standard)** | — |
-| Used by libp2p internally | no | no | **yes (dag-cbor)** | no |
+The original design proposed CBOR files per lishnet (`catalog/<networkID>.cbor`). This was reconsidered after the main branch migrated LISHs and lishnets to SQLite:
 
-### Decision: CBOR (RFC 8949)
+| Factor | CBOR files (rejected) | SQLite tables (selected) |
+|---|---|---|
+| New dependency | `cbor-x` npm package | none — `bun:sqlite` already in project |
+| Write strategy | full file rewrite on every change | per-row INSERT/UPDATE |
+| Crash safety | write-then-rename (near-atomic) | WAL mode (native, better) |
+| Search | in-memory O(n) filtering | SQL indexes + FTS5 fulltext |
+| Memory usage | entire catalog in RAM always | lazy load, SQL-side pagination |
+| Write latency (10K entries) | ~100ms (serialize + rewrite) | ~0.5ms (single row insert) |
+| Multi-lishnet | N files on disk | 1 DB, `network_id` column |
+| Delta sync query | serialize entire state | `SELECT ... WHERE hlc_wall > ?` |
+| Tombstone GC | load → filter → rewrite | `DELETE FROM ... WHERE expired < ?` |
+| Code consistency | separate persistence layer | same `db/*.ts` pattern as lishs/lishnets |
 
-**Selected**: `cbor-x` package for encoding/decoding.
+**Key insight**: The 2P-Set CRDT with LWW is semantically a **key-value store with version-based conflict resolution** — which is exactly what SQL `INSERT ON CONFLICT DO UPDATE WHERE` provides natively.
 
-**Why CBOR over JSON:**
+### CRDT → SQL Mapping
 
-1. **Native binary data** — Ed25519 signatures (64 bytes), public keys, and manifest hashes are binary. JSON requires base64 encoding (+33% size, encode/decode overhead on every operation). CBOR stores `Uint8Array` directly
-2. **~40% smaller files** — no repeated key names in quotes, no base64 bloat, compact integer encoding. A 5 MB JSON catalog becomes ~3 MB CBOR
-3. **~3x faster parsing** — `cbor-x` is one of the fastest serializers for Node/Bun, binary format skips text parsing entirely
-4. **IETF standard** — RFC 8949, widely adopted (WebAuthn, COSE signatures, IPFS dag-cbor, IoT). Not a niche format
-5. **libp2p ecosystem alignment** — IPFS and libp2p use dag-cbor internally for content-addressed data. Same conceptual model
+```
+2P-Set add set       =  catalog_entries table
+2P-Set remove set    =  catalog_tombstones table
+LWW resolution       =  ON CONFLICT DO UPDATE WHERE new_hlc > old_hlc
+opLog per entry      =  signed_op BLOB column (CBOR-encoded SignedCatalogOp)
+Vector clock         =  catalog_clocks table
+ACL                  =  catalog_acl table
+```
 
-**Why CBOR over MessagePack:**
+### Schema
 
-- MessagePack has no native `Uint8Array` type — binary data needs explicit `Ext` type wrapping
-- CBOR is an IETF standard (RFC 8949), MessagePack is a community spec
-- CBOR has COSE (RFC 9052) for signed structures — potential future use for standardized signature envelopes
-- Performance difference is negligible (`cbor-x` and `@msgpack/msgpack` are within 5% of each other)
+```sql
+-- backend/src/db/catalog.ts
 
-**Why CBOR over SQLite for catalog state:**
+CREATE TABLE IF NOT EXISTS catalog_entries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id        TEXT NOT NULL,
+    lish_id           TEXT NOT NULL,
+    name              TEXT,
+    description       TEXT,
+    publisher_peer_id TEXT NOT NULL,
+    published_at      TEXT NOT NULL,
+    chunk_size        INTEGER NOT NULL,
+    checksum_algo     TEXT NOT NULL,
+    total_size        INTEGER NOT NULL,
+    file_count        INTEGER NOT NULL,
+    manifest_hash     TEXT NOT NULL,
+    content_type      TEXT,
+    tags              TEXT,                  -- JSON array, e.g. '["linux","iso"]'
+    last_edited_by    TEXT,
+    hlc_wall          INTEGER NOT NULL,
+    hlc_logical       INTEGER NOT NULL,
+    hlc_node          TEXT NOT NULL,
+    signed_op         BLOB NOT NULL,         -- CBOR-encoded SignedCatalogOp for sync verification
+    UNIQUE(network_id, lish_id)
+);
 
-- The app already uses `bun:sqlite` for LISHs and lishnet storage (`libershare.db`). However, the **catalog CRDT state** has different requirements — full-state serialization on every change, not individual row updates
-- CRDT merge is simpler with full-state serialization than with SQL INSERT/UPDATE reconciliation
-- Full file rewrite is fine up to ~25 MB (~50K entries, ~100 ms write time)
-- SQLite would require mapping CRDT semantics to relational schema — added complexity for no gain at current scale
-- **Migration path**: If catalogs grow beyond 50K entries, catalog persistence can migrate to SQLite (a new table in `libershare.db`). The persistence layer is isolated from CRDT logic, so migration is a clean module swap
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_network ON catalog_entries(network_id);
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_hlc ON catalog_entries(network_id, hlc_wall);
 
-**When to reconsider SQLite:**
+CREATE TABLE IF NOT EXISTS catalog_tombstones (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id        TEXT NOT NULL,
+    lish_id           TEXT NOT NULL,
+    removed_by        TEXT NOT NULL,
+    removed_at        TEXT NOT NULL,
+    hlc_wall          INTEGER NOT NULL,
+    hlc_logical       INTEGER NOT NULL,
+    hlc_node          TEXT NOT NULL,
+    signed_op         BLOB NOT NULL,
+    UNIQUE(network_id, lish_id)
+);
 
-| Signal | Action |
-|---|---|
-| Catalog write time exceeds 100 ms | Migrate to SQLite |
-| Users request fulltext search across catalogs | Add SQLite with FTS5 |
-| Single catalog exceeds 50K entries | SQLite partial writes become essential |
-| Need to query across multiple lishnets | SQLite with shared DB file |
+CREATE INDEX IF NOT EXISTS idx_catalog_tombstones_network ON catalog_tombstones(network_id);
 
-### Implementation
+CREATE TABLE IF NOT EXISTS catalog_acl (
+    network_id        TEXT PRIMARY KEY,
+    owner             TEXT NOT NULL,          -- single PeerID
+    admins            TEXT NOT NULL DEFAULT '[]',     -- JSON array of PeerIDs
+    moderators        TEXT NOT NULL DEFAULT '[]',     -- JSON array of PeerIDs
+    restrict_writes   INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS catalog_clocks (
+    network_id        TEXT NOT NULL,
+    peer_id           TEXT NOT NULL,
+    hlc_wall          INTEGER NOT NULL,
+    hlc_logical       INTEGER NOT NULL,
+    PRIMARY KEY(network_id, peer_id)
+);
+
+-- FTS5 for fulltext search (from Phase 1, no migration needed later)
+CREATE VIRTUAL TABLE IF NOT EXISTS catalog_fts USING fts5(
+    name, description, tags,
+    content=catalog_entries,
+    content_rowid=id
+);
+```
+
+### LWW Merge in SQL
+
+The core CRDT operation — "if newer, update; if older, ignore" — is a single SQL statement:
+
+```sql
+INSERT INTO catalog_entries (network_id, lish_id, name, description,
+    publisher_peer_id, published_at, chunk_size, checksum_algo,
+    total_size, file_count, manifest_hash, content_type, tags,
+    last_edited_by, hlc_wall, hlc_logical, hlc_node, signed_op)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(network_id, lish_id) DO UPDATE SET
+    name = excluded.name,
+    description = excluded.description,
+    total_size = excluded.total_size,
+    file_count = excluded.file_count,
+    content_type = excluded.content_type,
+    tags = excluded.tags,
+    last_edited_by = excluded.last_edited_by,
+    hlc_wall = excluded.hlc_wall,
+    hlc_logical = excluded.hlc_logical,
+    hlc_node = excluded.hlc_node,
+    signed_op = excluded.signed_op
+WHERE excluded.hlc_wall > catalog_entries.hlc_wall
+   OR (excluded.hlc_wall = catalog_entries.hlc_wall
+       AND excluded.hlc_logical > catalog_entries.hlc_logical)
+   OR (excluded.hlc_wall = catalog_entries.hlc_wall
+       AND excluded.hlc_logical = catalog_entries.hlc_logical
+       AND excluded.hlc_node > catalog_entries.hlc_node);
+```
+
+This is deterministic — all peers applying the same set of operations will converge to the same state, regardless of order.
+
+### Security: Validation Before Storage
+
+**Critical**: In a P2P network with untrusted peers, every incoming operation MUST pass through a validation chain **before** any SQL write. The `upsertCatalogEntry()` function must never be called directly from API or network handlers.
 
 ```typescript
-// backend/src/catalog/catalog-persistence.ts
-import { Encoder, Decoder } from 'cbor-x';
-import { renameSync, existsSync, unlinkSync } from 'fs';
+// Mandatory validation chain for ALL remote operations
+async function handleRemoteOp(db: Database, networkID: string, op: SignedCatalogOp): Promise<boolean> {
+  // 1. SIGNATURE — Ed25519 verify (cryptographic, unforgeable)
+  if (!verifyCatalogOp(op)) return false;
 
-const encoder = new Encoder({ mapsAsObjects: true, useRecords: false });
-const decoder = new Decoder({ mapsAsObjects: true });
+  // 2. ACL — does this PeerID have the required role?
+  if (!checkACL(db, networkID, op)) return false;
 
-interface CatalogSnapshot {
-  version: 1;                           // schema version for forward compatibility
-  entries: CatalogEntry[];
-  tombstones: TombstoneEntry[];
-  opLog: SignedCatalogOp[];             // last op per entry/tombstone (for bilateral sync verification)
-  access: ICatalogAccess;
-  vectorClock: Record<string, HLC>;
-  localClock: HLC;
-  syncState: Record<string, HLC>;
-}
+  // 3. DRIFT — is wallTime within ±5 minutes of local time?
+  if (Math.abs(op.payload.hlc.wallTime - Date.now()) > MAX_DRIFT) return false;
 
-export async function saveCatalog(path: string, state: CatalogCRDTState): Promise<void> {
-  const snapshot: CatalogSnapshot = {
-    version: 1,
-    entries: [...state.entries.values()],
-    tombstones: [...state.tombstones.values()],
-    opLog: [...state.opLog.values()],
-    access: state.access,
-    vectorClock: Object.fromEntries(state.vectorClock),
-    localClock: state.localClock,
-    syncState: Object.fromEntries(state.syncState),
-  };
-  const bytes = encoder.encode(snapshot);
+  // 4. CONTENT — valid fields, reasonable sizes?
+  if (!validateFields(op)) return false;
 
-  // Crash-safe: write to temp file, then rename (atomic on POSIX, near-atomic on NTFS)
-  const tmpPath = path + '.tmp';
-  await Bun.write(tmpPath, bytes);
-  renameSync(tmpPath, path);
-}
+  // 5. ANTI-REPLAY — is HLC > last seen from this author?
+  if (!checkVectorClock(db, networkID, op)) return false;
 
-export async function loadCatalog(path: string): Promise<CatalogSnapshot | null> {
-  // Try main file first, then temp file (crash recovery)
-  for (const candidate of [path, path + '.tmp']) {
-    try {
-      if (!existsSync(candidate)) continue;
-      const buf = await Bun.file(candidate).arrayBuffer();
-      const bytes = new Uint8Array(buf);
-      const snapshot = decoder.decode(bytes) as CatalogSnapshot;
-      // Clean up stale temp file if main file loaded successfully
-      if (candidate === path && existsSync(path + '.tmp')) {
-        try { unlinkSync(path + '.tmp'); } catch {}
-      }
-      return snapshot;
-    } catch {
-      continue;  // corrupt file, try next candidate
-    }
-  }
-  return null;  // all files missing or corrupt → start fresh, sync from peers
+  // ALL checks passed — now store (SQL handles LWW merge)
+  upsertCatalogEntry(db, networkID, op);
+  updateVectorClock(db, networkID, op.signer, op.payload.hlc);
+  return true;
 }
 ```
 
-**Signature storage comparison** (per entry):
+**Layers of defense** (from strongest to weakest):
 
-```
-JSON:    "signature": "MEUCIQC7x2nQ3Kp..."   → 92 bytes (base64 of 64-byte Ed25519 sig)
-CBOR:    signature: <64 raw bytes>             → 66 bytes (2-byte CBOR header + 64 bytes)
+| Layer | Defense | Bypass possible? |
+|---|---|---|
+| 1. Signature | Ed25519 — peer cannot impersonate another | No (cryptographic) |
+| 2. ACL | Role check against catalog_acl table | Only if ACL is compromised |
+| 3. HLC drift | Reject wallTime > ±5 min from local time | Peer can gain ≤5 min advantage |
+| 4. Content | Field size limits, valid types | No (deterministic validation) |
+| 5. Anti-replay | Vector clock — reject ops ≤ last seen HLC | No (monotonic clock) |
 
-Per 10K entries: JSON wastes ~260 KB on base64 encoding alone.
-```
+**What cannot be defended against**:
+- Malicious owner (root of trust — if compromised, the entire lishnet is compromised)
+- Malicious moderator (can write bad data until revoked by admin/owner)
+- 100% eclipse (attacker controls all connections — can suppress legitimate data)
+
+### CBOR Role (Wire Format Only)
+
+CBOR (`cbor-x`) is no longer used for persistence. It remains for:
+
+| Use | Format |
+|---|---|
+| `signed_op` BLOB column | CBOR-encoded `SignedCatalogOp` — preserved for re-forwarding to other peers during bilateral sync |
+| Bilateral sync wire protocol | CBOR stream over `/lish/catalog-sync/1.0.0` |
+| GossipSub messages | JSON (unchanged — gossipsub requires text payloads) |
+
+The `signed_op` blob is critical in the untrusted P2P model: when peer A sends data to peer B during sync, B must verify the original signature. Storing the full `SignedCatalogOp` envelope means it can be forwarded without re-signing (which would be impossible — A doesn't have the original author's private key).
 
 ### Tamper Resistance
 
-The local file is a **cache**, not a source of truth. Signatures are the source of truth:
+The local database is a **cache**, not a source of truth. Signatures inside `signed_op` blobs are the source of truth:
 
 | Tampering scenario | What happens |
 |---|---|
-| Peer edits a field in the file | Signature becomes invalid → overwritten on next sync |
-| Peer deletes the file | Fresh start → bilateral sync restores full catalog from peers |
-| Peer adds fake entry | No valid moderator signature → rejected by all peers on sync |
+| Peer edits a field in SQLite directly | Signature in `signed_op` becomes invalid → overwritten on next sync |
+| Peer deletes the database | Fresh start → bilateral sync restores full catalog from peers |
+| Peer adds fake entry to SQLite | No valid moderator signature → rejected by all peers on sync |
 | Peer removes a tombstone | Tombstone comes back from other peers on next sync |
-| File corrupted (disk error) | CBOR decode fails → treated as missing → sync from peers |
+| Database corrupted (disk error) | SQLite WAL recovery or fresh start → sync from peers |
 
-The CRDT state can always be **fully reconstructed from the network**. The local file only exists to avoid re-downloading everything on every restart.
+The CRDT state can always be **fully reconstructed from the network**. The local database only exists to avoid re-downloading everything on every restart.
 
-### Example: Logical structure (shown as JSON for readability)
+### Delta Sync Query
 
-The actual file is binary CBOR, but the logical structure is:
+Instead of serializing entire state, delta sync is a simple SQL query:
 
-```json
-{
-  "entries": [
-    {
-      "lishID": "34aacabb-...",
-      "name": "Ubuntu 24.04 LTS",
-      "publisherPeerID": "12D3KooW...",
-      "publishedAt": "2026-02-28T22:00:00Z",
-      "fileCount": 1,
-      "totalSize": 4800000000,
-      "hlc": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
-      "signature": "<64 bytes binary, not base64>"
-    }
-  ],
-  "tombstones": [],
-  "access": {
-    "owner": "12D3KooWJdctGgbEdbUTCvpCoW73E67mHF92v4dD7yvxAkVztnCy",
-    "admins": [],
-    "moderators": ["12D3KooWAbc..."],
-    "restrictCatalogWrites": true
-  },
-  "vectorClock": {
-    "12D3KooWJdc...": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
-    "12D3KooWAbc...": { "wallTime": 1709164700000, "logical": 2, "nodeID": "12D3KooWAbc..." }
-  },
-  "localClock": { "wallTime": 1709164800000, "logical": 0, "nodeID": "12D3KooWJdc..." },
-  "syncState": {
-    "12D3KooWAbc...": { "wallTime": 1709164650000, "logical": 0, "nodeID": "12D3KooWJdc..." }
-  }
-}
+```sql
+-- What does peer X need? (they last saw HLC with wallTime = ?)
+SELECT signed_op FROM catalog_entries
+WHERE network_id = ? AND hlc_wall > ?
+UNION ALL
+SELECT signed_op FROM catalog_tombstones
+WHERE network_id = ? AND hlc_wall > ?;
+```
+
+### Tombstone Garbage Collection
+
+```sql
+-- One statement instead of load-filter-rewrite
+DELETE FROM catalog_tombstones
+WHERE network_id = ? AND removed_at < datetime('now', '-30 days');
 ```
 
 ---
@@ -940,11 +990,12 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 ## 9. Implementation Phases
 
 ### Phase 1: Core CRDT + Persistence (Backend)
-- `CatalogCRDT` class (entries, tombstones, opLog, merge, LWW, operation queue)
+- SQLite catalog tables in `db/catalog.ts` (entries, tombstones, ACL, clocks, FTS5)
+- LWW merge via `INSERT ON CONFLICT DO UPDATE WHERE` with HLC comparison
 - HLC implementation (tick, merge, compare)
 - Signature generation and verification (Ed25519 via `@libp2p/crypto`)
-- Crash-safe CBOR persistence (write-then-rename, debounced saves, opLog serialization)
-- `CatalogManager` class (multi-lishnet lifecycle, load/unload catalogs)
+- Validation chain: signature → ACL → drift → content → anti-replay → SQL write
+- `CatalogManager` class (multi-lishnet lifecycle, DB-backed)
 - Add `ownerPeerID` field to `ILISHNetwork` shared type
 - Add `getPrivateKey()`, `registerStreamHandler()`, and `dialProtocolByPeerId()` to `Network` class
 - Update `TopicHandler` type to `(data: Record<string, any>) => void | Promise<void>` (async support)
@@ -958,7 +1009,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - ACL operations (add/remove admin/moderator, cascading revocation)
 - Integration with `Networks` class (join → catalog load, leave → catalog unload)
 - Old protocol coexistence (`add_lish`/`del_lish` ignored by catalog layer)
-- In-memory search (AND-logic term matching)
+- FTS5 fulltext search (SQL-based from Phase 1)
 
 ### Phase 3: API + Frontend
 - WebSocket API methods for catalog CRUD (`catalog.list`, `catalog.publish`, `catalog.search`, etc.)
@@ -977,7 +1028,6 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - Catalog size limits per network
 - Merkle Search Tree anti-entropy (for catalogs > 10K entries)
 - Content availability verification (random chunk challenge)
-- SQLite migration path (when catalogs exceed 50K entries)
 - Metrics and monitoring
 
 ---
@@ -988,7 +1038,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Signature covers payload + authorPeerID + HLC (canonical JSON via json-canonicalize)
 - [ ] ACL changes validated against role hierarchy before application
 - [ ] HLC anti-replay check on every received operation (hlcCompare > 0)
-- [ ] HLC clock drift check: reject ops with wallTime > 60s in the future
+- [ ] HLC clock drift check: reject ops with wallTime > 5 minutes in the future (MAX_DRIFT)
 - [ ] Owner PeerID is immutable (from .lishnet config, not from network)
 - [ ] Bilateral sync stream authenticated via libp2p Noise handshake
 - [ ] Cross-validate catalog state from multiple peers on initial sync
@@ -1002,7 +1052,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Per-publisher write quota enforced (MAX_ENTRIES_PER_PUBLISHER)
 - [ ] Global catalog size cap enforced (MAX_CATALOG_SIZE)
 - [ ] Sliding-window rate limiter per publisher PeerID
-- [ ] vectorClock (HLC map) persisted to disk and reloaded on restart (prevents replay after restart)
+- [ ] vectorClock persisted in catalog_clocks table and loaded on restart (prevents replay after restart)
 - [ ] GossipSub topic validator registered for catalog topics (REJECT invalid sigs, IGNORE rate-limited)
 - [ ] Content availability verification via random chunk challenge (optional, Phase 4)
 - [ ] Emergency revocation: acl_revoke propagates within 1 heartbeat cycle
@@ -1013,7 +1063,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
 - [ ] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
 - [ ] Field size limits enforced before signature verification (fail fast)
-- [ ] Schema version included in CBOR snapshot and sync protocol
+- [ ] Schema version included in catalog tables and sync protocol
 - [ ] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
 - [ ] Bilateral sync: stream timeout (30s), payload size limit (10 MB), CBOR decode error handling
 - [ ] Bilateral sync: invalid signatures in delta → reject entries, penalize peer (P5 score -5)
@@ -1675,26 +1725,30 @@ How `catalog.publish(networkID, lishID)` works from API call to broadcast. **Imp
 
 ### 15.6 CatalogManager: Multi-Lishnet Lifecycle
 
-Each joined lishnet needs its own `CatalogCRDT` instance. A `CatalogManager` coordinates lifecycle.
+`CatalogManager` coordinates catalog operations across all joined lishnets. Unlike the original in-memory design, catalog data lives in SQLite — the manager only holds lightweight per-network state (local clock, ACL cache, anti-entropy timers).
 
 ```typescript
 // backend/src/catalog/catalog-manager.ts
 
 export class CatalogManager {
-  private catalogs: Map<string, CatalogCRDT> = new Map();
-  private readonly dataDir: string;
+  private readonly db: Database;
   private readonly network: Network;
   private syncHandlerRegistered: boolean = false;
 
-  constructor(dataDir: string, network: Network) {
-    this.dataDir = dataDir;
+  // Per-network lightweight state (NOT the catalog data — that's in SQLite)
+  private joined: Map<string, {
+    localClock: HLC;
+    aclCache: ICatalogAccess;
+    antiEntropyTimer: Timer | null;
+  }> = new Map();
+
+  constructor(db: Database, network: Network) {
+    this.db = db;
     this.network = network;
   }
 
   /**
    * Register the bilateral sync handler (once, shared by all catalogs).
-   * libp2p allows only one handler per protocol path, so CatalogManager
-   * owns the handler and dispatches by networkID from the request body.
    */
   private async ensureSyncHandler(): Promise<void> {
     if (this.syncHandlerRegistered) return;
@@ -1702,85 +1756,63 @@ export class CatalogManager {
       '/lish/catalog-sync/1.0.0',
       async (stream) => {
         const request = await readSyncRequest(stream);  // CBOR decode
-        const crdt = this.catalogs.get(request.networkID);
-        if (crdt) {
-          await crdt.handleSyncStream(stream, request);
+        if (this.joined.has(request.networkID)) {
+          await this.handleSyncStream(stream, request);
         }
-        // Unknown networkID → close stream silently
       }
     );
     this.syncHandlerRegistered = true;
   }
 
   /**
-   * Load or create a catalog for a lishnet.
-   * Called when a lishnet is joined (enabled).
-   * ownerPeerID comes from ILISHNetwork.ownerPeerID — if absent, catalog is not created.
+   * Join a lishnet's catalog.
+   * Called when a lishnet is enabled. ownerPeerID comes from ILISHNetwork.ownerPeerID.
    */
   async join(networkID: string, ownerPeerID: string): Promise<void> {
-    if (this.catalogs.has(networkID)) return;
+    if (this.joined.has(networkID)) return;
 
-    // Ensure bilateral sync handler is registered (once)
     await this.ensureSyncHandler();
 
-    // Load from disk or create fresh
-    const path = `${this.dataDir}/catalog/${networkID}.cbor`;
-    const snapshot = await loadCatalog(path);
+    // Ensure ACL exists in DB (create if first join)
+    ensureCatalogACL(this.db, networkID, ownerPeerID);
 
-    const crdt = new CatalogCRDT(networkID, ownerPeerID, this.network, this.dataDir);
-    if (snapshot) {
-      crdt.loadFromSnapshot(snapshot);
-    }
+    // Load lightweight state from DB
+    const acl = getCatalogACL(this.db, networkID);
+    const lastClock = getLatestClock(this.db, networkID, this.network.getNodeInfo().peerID);
 
-    this.catalogs.set(networkID, crdt);
+    this.joined.set(networkID, {
+      localClock: lastClock ?? { wallTime: 0, logical: 0, nodeID: this.network.getNodeInfo().peerID },
+      aclCache: acl,
+      antiEntropyTimer: null,
+    });
 
-    // Start periodic bilateral sync (anti-entropy) for this catalog
-    crdt.startAntiEntropy();
+    // Start periodic bilateral sync
+    this.startAntiEntropy(networkID);
 
-    // Register GossipSub handler for catalog_op messages on this network's topic.
-    // Note: Networks.subscribeTopic() already subscribes to the gossipsub topic
-    // and registers the `want` handler. This call only adds an additional handler
-    // for catalog_op messages — the double pubsub.subscribe() inside is idempotent.
-    // Note: TopicHandler type in network.ts is currently sync `(data: Record<string, any>) => void`.
-    // Must be updated to `(data: Record<string, any>) => void | Promise<void>` to support async handlers.
+    // Register GossipSub handler for catalog_op messages
     await this.network.subscribe(lishTopic(networkID), async (msg) => {
       if (msg.type === 'catalog_op') {
-        await crdt.handleRemoteOperation(msg);
-        // scheduleSave() is called internally by handleRemoteOperation()
+        await handleRemoteOp(this.db, networkID, msg as SignedCatalogOp);
       }
     });
   }
 
   /**
-   * Unload a catalog when leaving a lishnet.
+   * Leave a lishnet's catalog (stop anti-entropy, clear cache).
+   * Data stays in SQLite for potential re-join.
    */
   async leave(networkID: string): Promise<void> {
-    const crdt = this.catalogs.get(networkID);
-    if (!crdt) return;
-    crdt.stopAntiEntropy();
-    await crdt.flush();  // persist any pending changes
-    this.catalogs.delete(networkID);
+    const state = this.joined.get(networkID);
+    if (!state) return;
+    if (state.antiEntropyTimer) clearInterval(state.antiEntropyTimer);
+    this.joined.delete(networkID);
   }
 
-  /**
-   * Get catalog for a specific network.
-   */
-  get(networkID: string): CatalogCRDT | undefined {
-    return this.catalogs.get(networkID);
-  }
-
-  /**
-   * Flush all catalogs (called on graceful shutdown).
-   */
-  async flushAll(): Promise<void> {
-    for (const crdt of this.catalogs.values()) {
-      await crdt.flush();
-    }
-  }
+  // ... startAntiEntropy(), handleSyncStream(), etc.
 }
 ```
 
-**Integration with Networks class**: `CatalogManager` is created alongside `Networks` in `app.ts`, receiving `networks.getNetwork()` as its `Network` dependency. When `networks.setEnabled(id, true)` is called, it also calls:
+**Integration with Networks class**: `CatalogManager` is created alongside `Networks` in `app.ts`, receiving `db` and `networks.getNetwork()` as dependencies. When `networks.setEnabled(id, true)` is called:
 
 ```typescript
 const net = networks.get(id);
@@ -1790,81 +1822,60 @@ if (net?.ownerPeerID) {
 // Networks without ownerPeerID skip catalog (v1 .lishnet files)
 ```
 
-When disabled, `await catalogManager.leave(id)`. On shutdown, `await catalogManager.flushAll()`.
+When disabled, `await catalogManager.leave(id)`.
 
-**Memory**: Each `CatalogCRDT` holds its catalog in memory. For a typical lishnet with 1K entries (~500 KB), having 10 joined lishnets costs ~5 MB RAM. Acceptable.
+**Memory**: Per-network state is ~200 bytes (HLC + ACL cache + timer ref). 100 joined lishnets = ~20 KB RAM. Catalog data is in SQLite, not RAM.
 
 ### 15.7 Search Implementation
 
-`catalog.search(networkID, query)` needs a strategy.
-
-**Phase 1: In-memory filtering** (simple, sufficient for < 10K entries):
+`catalog.search(networkID, query)` uses **FTS5 fulltext search** from Phase 1 (no separate "in-memory phase" needed since catalog is in SQLite).
 
 ```typescript
-function searchCatalog(entries: CatalogEntry[], query: string): CatalogEntry[] {
-  const q = query.toLowerCase().trim();
-  if (!q) return entries;
+// backend/src/db/catalog.ts
 
-  const terms = q.split(/\s+/);
+function searchCatalog(db: Database, networkID: string, query: string, limit: number = 100): CatalogEntry[] {
+  const q = query.trim();
+  if (!q) return listCatalogEntries(db, networkID, limit);
 
-  return entries
-    .filter(entry => {
-      const searchable = [
-        entry.name ?? '',
-        entry.description ?? '',
-        entry.contentType ?? '',
-        ...(entry.tags ?? []),
-      ].join(' ').toLowerCase();
+  // Tag-only search: #linux → exact tag match
+  if (q.startsWith('#')) {
+    const tag = q.slice(1);
+    return db.query<CatalogEntryRow, [string, string, number]>(
+      `SELECT * FROM catalog_entries
+       WHERE network_id = ? AND json_each.value = ?
+       JOIN json_each(tags) ON 1=1
+       LIMIT ?`,
+      [networkID, tag, limit]
+    ).all().map(rowToEntry);
+  }
 
-      // All terms must match (AND logic)
-      return terms.every(term => searchable.includes(term));
-    })
-    .sort((a, b) => {
-      // Relevance scoring: name match (2) > tag match (1) > description-only match (0)
-      const score = (e: CatalogEntry): number => {
-        const name = (e.name ?? '').toLowerCase();
-        const tags = (e.tags ?? []).join(' ').toLowerCase();
-        let s = 0;
-        for (const term of terms) {
-          if (name.includes(term)) s += 2;
-          else if (tags.includes(term)) s += 1;
-        }
-        return s;
-      };
-      const diff = score(b) - score(a);
-      if (diff !== 0) return diff;
-      // Tiebreaker: newest first (by HLC)
-      return hlcCompare(b.hlc, a.hlc);
-    });
+  // FTS5 fulltext search with ranking
+  return db.query<CatalogEntryRow, [string, string, number]>(
+    `SELECT e.*, fts.rank FROM catalog_fts fts
+     JOIN catalog_entries e ON e.id = fts.rowid
+     WHERE fts.catalog_fts MATCH ? AND e.network_id = ?
+     ORDER BY fts.rank
+     LIMIT ?`,
+    [q, networkID, limit]
+  ).all().map(rowToEntry);
 }
 ```
 
-**Phase 2: SQLite FTS5** (when catalogs exceed 10K entries or users request fulltext):
+**FTS5 sync triggers** (keep FTS index in sync with catalog_entries):
 
 ```sql
-CREATE VIRTUAL TABLE catalog_fts USING fts5(
-  name, description, tags, content_type,
-  content='catalog_entries', content_rowid='rowid'
-);
+-- After INSERT into catalog_entries
+INSERT INTO catalog_fts(rowid, name, description, tags)
+VALUES (last_insert_rowid(), ?, ?, ?);
 
--- Triggered on catalog merge (insert/update)
-INSERT INTO catalog_fts(rowid, name, description, tags, content_type)
-VALUES (?, ?, ?, ?, ?);
+-- After UPDATE on catalog_entries
+UPDATE catalog_fts SET name = ?, description = ?, tags = ? WHERE rowid = ?;
 
--- Search with ranking
-SELECT *, rank FROM catalog_fts WHERE catalog_fts MATCH ? ORDER BY rank;
+-- After DELETE from catalog_entries (tombstone)
+DELETE FROM catalog_fts WHERE rowid = ?;
 ```
 
-This aligns with the SQLite migration path defined in section 6. FTS5 would be added when SQLite replaces CBOR for persistence.
-
-**Tag-only search**: When query starts with `#`, search only in tags:
-
-```typescript
-if (q.startsWith('#')) {
-  const tag = q.slice(1).toLowerCase();
-  return entries.filter(e => e.tags?.some(t => t === tag));
-}
-```
+These are called from the `upsertCatalogEntry()` and `applyRemoveOp()` functions in `db/catalog.ts`, not via SQLite triggers (to keep control in application code for the untrusted validation chain).
 
 ### 15.8 Bilateral Sync Error Handling
 
@@ -1920,17 +1931,22 @@ async function handleCatalogSyncStream(stream: Stream): Promise<void> {
 
 **Retry strategy**: Exponential backoff with jitter. Max 3 retries per sync attempt. After 3 failures, wait for next periodic sync interval (60 seconds).
 
-### 15.9 Crash-Safe Persistence (Atomic Writes)
+### 15.9 Crash-Safe Persistence (WAL Mode)
 
-`Bun.write(path, bytes)` is **not guaranteed atomic** on all filesystems. A crash during write can corrupt the file.
+With catalog data in `libershare.db`, crash safety is handled by SQLite's **WAL (Write-Ahead Logging)** mode, already enabled in `openDatabase()`:
 
-**Decision: Rename trick (write-then-rename).** Implemented in `saveCatalog()` and `loadCatalog()` in section 6:
+```typescript
+db.run('PRAGMA journal_mode = WAL');
+```
 
-- `saveCatalog()` writes to `.tmp` file first, then `renameSync()` atomically replaces the main file
-- `loadCatalog()` tries main file first, falls back to `.tmp` if corrupt (crash recovery)
-- Both functions are `async` (using `await Bun.file().arrayBuffer()`)
+WAL provides:
+- **Atomic transactions** — all writes in a transaction either fully commit or fully rollback
+- **Concurrent reads during writes** — readers don't block writers and vice versa
+- **Automatic crash recovery** — WAL file is replayed on next open after unclean shutdown
 
-**Worst case**: Both files are corrupt → treated as fresh start, bilateral sync from peers restores the full catalog. The CRDT state is always fully reconstructable from the network.
+No write-then-rename trick needed. No `.tmp` files. No manual crash recovery code.
+
+**Worst case**: Database is irrecoverably corrupted → delete `libershare.db` and start fresh. Bilateral sync from peers restores the full catalog. The CRDT state is always fully reconstructable from the network.
 
 ### 15.10 Concurrency Model (Bun Single-Threaded)
 
@@ -1938,18 +1954,22 @@ Bun runs on a single thread with an event loop. Multiple simultaneous sync strea
 
 **Problem 1: Long sync blocks the event loop.**
 
-A large catalog sync (50K entries, ~25 MB CBOR) could take 100+ ms to decode. During this time, no GossipSub messages are processed.
+A large catalog sync (50K entries, ~25 MB CBOR) could take 100+ ms to decode and validate. During this time, no GossipSub messages are processed.
 
 **Solution**: Chunk processing with `setImmediate()`:
 
 ```typescript
-async function processSyncDelta(ops: SignedCatalogOp[], crdt: CatalogCRDT): Promise<void> {
+async function processSyncDelta(db: Database, networkID: string, ops: SignedCatalogOp[]): Promise<void> {
   const BATCH_SIZE = 500;
   for (let i = 0; i < ops.length; i += BATCH_SIZE) {
     const batch = ops.slice(i, i + BATCH_SIZE);
-    for (const op of batch) {
-      crdt.mergeSyncOp(op);  // signature verification + CRDT merge
-    }
+    // Each batch in a SQLite transaction for atomicity
+    const tx = db.transaction(() => {
+      for (const op of batch) {
+        handleRemoteOp(db, networkID, op);  // validation + SQL upsert
+      }
+    });
+    tx();
     // Yield to event loop every 500 operations
     await new Promise(resolve => setImmediate(resolve));
   }
@@ -1960,20 +1980,7 @@ async function processSyncDelta(ops: SignedCatalogOp[], crdt: CatalogCRDT): Prom
 
 A GossipSub message arrives while a bilateral sync is being processed for the same network.
 
-**Solution**: Per-network operation queue:
-
-```typescript
-class CatalogCRDT {
-  private opQueue: Promise<void> = Promise.resolve();
-
-  async enqueueOperation(op: () => Promise<void>): Promise<void> {
-    this.opQueue = this.opQueue.then(op).catch(err => {
-      console.error('Catalog operation failed:', err);
-    });
-    return this.opQueue;
-  }
-}
-```
+**Solution**: SQLite handles this natively — WAL mode allows concurrent reads and serializes writes. Each `handleRemoteOp()` call is a self-contained transaction. No application-level queue needed (unlike the in-memory design which required explicit `enqueueOperation()`).
 
 All catalog mutations (GossipSub ops, bilateral sync deltas, local publishes) go through `enqueueOperation()`. Since Bun is single-threaded, this is a simple promise chain — no locks needed.
 
@@ -2646,12 +2653,10 @@ shared/src/
 
 backend/src/
 ├── catalog/
-│   ├── catalog-crdt.ts     (NEW: CatalogCRDT class — core CRDT logic, merge, validation)
 │   ├── catalog-hlc.ts      (NEW: HLC implementation — tick, merge, compare)
 │   ├── catalog-signer.ts   (NEW: signCatalogOp, verifyCatalogOp — Ed25519 signing)
-│   ├── catalog-persistence.ts (NEW: saveCatalog, loadCatalog — CBOR with crash safety)
-│   ├── catalog-manager.ts  (NEW: CatalogManager — multi-lishnet lifecycle)
-│   ├── catalog-search.ts   (NEW: searchCatalog — in-memory filtering with relevance)
+│   ├── catalog-validator.ts (NEW: handleRemoteOp validation chain — sig, ACL, drift, content, anti-replay)
+│   ├── catalog-manager.ts  (NEW: CatalogManager — multi-lishnet lifecycle, DB-backed)
 │   └── catalog-sync.ts     (NEW: bilateral sync stream handler + initiator)
 ├── api/
 │   ├── catalog.ts          (NEW: initCatalogHandlers — WebSocket API)
@@ -2663,6 +2668,7 @@ backend/src/
 ├── lishnet/
 │   └── lishnets.ts         (EDIT: call catalogManager.join/leave on setEnabled)
 ├── db/
+│   ├── catalog.ts          (NEW: catalog tables schema, CRUD, LWW upsert, FTS5 sync, delta queries)
 │   └── lishnets.ts         (EDIT: add owner_peer_id column via ALTER TABLE)
 └── app.ts                  (EDIT: create CatalogManager, pass to APIServer)
 
@@ -2676,8 +2682,8 @@ frontend/src/
     └── catalog.ts          (NEW: catalog API client wrapper, event subscriptions)
 ```
 
-**Total new files**: 9 backend + 1 shared + 1 frontend script = 11 new files
-**Total edited files**: 8 (server.ts, network.ts, network-config.ts, lishnet/lishnets.ts, db/lishnets.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
+**Total new files**: 7 backend + 1 shared + 1 frontend script = 9 new files
+**Total edited files**: 9 (server.ts, network.ts, network-config.ts, lishnet/lishnets.ts, db/lishnets.ts, db/database.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
 
 ---
 
