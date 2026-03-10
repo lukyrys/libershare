@@ -10,7 +10,7 @@
 
 ## 1. Problem Statement
 
-LiberShare currently has no way for peers to discover what content is available in a network. The Products/Library page is a hardcoded mockup with 200 fake items. To make the app useful, each lishnet needs a **shared, replicated catalog** of available LISHs that all peers can browse and search.
+LiberShare currently has no way for peers to discover what content is available in a network. The Products/Library page is a hardcoded mockup with 200 placeholder items. To make the app useful, each lishnet needs a **shared, replicated catalog** of available LISHs that all peers can browse and search.
 
 ### Requirements
 
@@ -198,7 +198,7 @@ In a decentralized P2P network, any peer can connect and attempt to:
 
 libp2p already provides this. Each peer has an Ed25519 keypair:
 - **PeerID** is derived from the public key (unforgeable)
-- **Private key** is stored locally in the SQLite datastore
+- **Private key** is stored locally in `datastore.db` (libp2p's peer store, separate from the app's `libershare.db`)
 - **Noise protocol** encrypts and authenticates all connections
 
 **Implication**: A peer cannot impersonate another peer. PeerID is cryptographically bound to the keypair.
@@ -716,13 +716,12 @@ The CRDT state lives **in memory** during runtime. Persistence is a snapshot wri
 
 ```
 data/
-├── lishs.json            (existing - local LISH manifests)
-├── lishnets.json         (existing - network configs)
+├── libershare.db         (existing - LISHs + LISHnets, bun:sqlite with WAL)
 ├── settings.json         (existing)
 ├── catalog/
 │   ├── <networkID>.cbor  (catalog entries + tombstones + ACL)
 │   └── <networkID>.cbor
-└── datastore.db          (existing - libp2p peer store)
+└── datastore.db          (existing - libp2p peer store, separate from app DB)
 ```
 
 ### Format Evaluation
@@ -735,7 +734,7 @@ data/
 | Parse speed (10K) | ~50 ms | ~20 ms | **~15 ms** | ~5 ms (indexed query) |
 | Search | filter in memory | filter in memory | **filter in memory** | SQL + FTS5 fulltext |
 | Human readable | yes (text editor) | no | **no** | SQLite browser |
-| New dependency | none | @msgpack/msgpack | **cbor-x** | none (bun:sqlite) |
+| New dependency | none | @msgpack/msgpack | **cbor-x** | none (bun:sqlite, already used) |
 | Binary data support | no (base64 workaround) | limited | **native (Uint8Array, Buffer)** | native (BLOB) |
 | Standards | RFC 8259 | msgpack.org spec | **RFC 8949 (IETF standard)** | — |
 | Used by libp2p internally | no | no | **yes (dag-cbor)** | no |
@@ -759,13 +758,13 @@ data/
 - CBOR has COSE (RFC 9052) for signed structures — potential future use for standardized signature envelopes
 - Performance difference is negligible (`cbor-x` and `@msgpack/msgpack` are within 5% of each other)
 
-**Why CBOR over SQLite (for now):**
+**Why CBOR over SQLite for catalog state:**
 
-- SQLite solves a different problem (partial writes, indexed queries) that we don't need at <10K entries
+- The app already uses `bun:sqlite` for LISHs and lishnet storage (`libershare.db`). However, the **catalog CRDT state** has different requirements — full-state serialization on every change, not individual row updates
 - CRDT merge is simpler with full-state serialization than with SQL INSERT/UPDATE reconciliation
 - Full file rewrite is fine up to ~25 MB (~50K entries, ~100 ms write time)
 - SQLite would require mapping CRDT semantics to relational schema — added complexity for no gain at current scale
-- **Migration path**: If catalogs grow beyond 50K entries, SQLite becomes the right choice. The persistence layer is isolated from CRDT logic, so migration is a clean module swap
+- **Migration path**: If catalogs grow beyond 50K entries, catalog persistence can migrate to SQLite (a new table in `libershare.db`). The persistence layer is isolated from CRDT logic, so migration is a clean module swap
 
 **When to reconsider SQLite:**
 
@@ -1460,7 +1459,7 @@ In a P2P system, entries are signed at creation time. The signature proves the e
 
 ## 15. Open Design Questions — Integration with Existing Codebase (Resolved)
 
-Analysis of existing backend source code (`network.ts`, `networks.ts`, `lishnetStorage.ts`, `network-config.ts`, shared types, `LISH_NETWORK_PROTOCOL.md`) reveals the following integration gaps that must be resolved before implementation.
+Analysis of existing backend source code (`protocol/network.ts`, `lishnet/lishnets.ts`, `db/lishnets.ts`, `protocol/network-config.ts`, shared types, `LISH_NETWORK_PROTOCOL.md`) reveals the following integration gaps that must be resolved before implementation.
 
 ### 15.1 Protocol Command Mapping: Old Protocol → Catalog System
 
@@ -1509,7 +1508,7 @@ The catalog system introduces `ICatalogAccess` as the **first actual implementat
 ```
 Current codebase (implemented):
   ILISHNetwork / LISHNetworkConfig:
-    networkID, name, description, bootstrapPeers, enabled
+    networkID, name, description, bootstrapPeers, created, enabled
     → NO role fields, no access control
 
 Protocol spec (LISH_NETWORK_PROTOCOL.md, NOT implemented):
@@ -1537,9 +1536,8 @@ Catalog system (new, to be implemented):
 The current `ILISHNetwork` interface lacks an `owner` field:
 
 ```typescript
-// Current (shared/src/index.ts)
+// Current (shared/src/index.ts) — note: `version` field was removed from ILISHNetwork
 export interface ILISHNetwork {
-  version: number;
   networkID: string;
   name: string;
   description?: string;
@@ -1550,12 +1548,11 @@ export interface ILISHNetwork {
 
 The catalog system requires a trusted owner PeerID as the root of the ACL chain.
 
-**Decision: Add `ownerPeerID` to `.lishnet` format.**
+**Decision: Add `ownerPeerID` to `ILISHNetwork` and `.lishnet` format.**
 
 ```typescript
-// Updated
+// Updated — ownerPeerID added as optional field
 export interface ILISHNetwork {
-  version: number;        // bump to 2
   networkID: string;
   name: string;
   description?: string;
@@ -1565,7 +1562,13 @@ export interface ILISHNetwork {
 }
 ```
 
-**Field is optional** for backward compatibility — version 1 `.lishnet` files without `ownerPeerID` work for file sharing but cannot use the catalog system. When a user creates a new lishnet in LiberShare, `ownerPeerID` is automatically set to their PeerID.
+Also add `ownerPeerID` to the `LISHNetworkDefinition` and `LISHNetworkConfig` types (which extend or mirror `ILISHNetwork`), and to the `lishnets` SQLite table:
+
+```sql
+ALTER TABLE lishnets ADD COLUMN owner_peer_id TEXT;
+```
+
+**Field is optional** for backward compatibility — `.lishnet` files without `ownerPeerID` work for file sharing but cannot use the catalog system. When a user creates a new lishnet in LiberShare, `ownerPeerID` is automatically set to their PeerID.
 
 **Validation**: `ownerPeerID` must be a valid Ed25519 PeerID (starts with `12D3KooW`). If present, it becomes `ICatalogAccess.owner`. If missing, catalog features are disabled for that network.
 
@@ -1626,7 +1629,7 @@ How `catalog.publish(networkID, lishID)` works from API call to broadcast. **Imp
 1. Frontend calls: catalog.publish(networkID, lishID)
 
 2. Backend resolves local LISH:
-   const lish = dataServer.get(lishID);  // returns LISHData | undefined — lishID is a plain string, not a branded type
+   const lish = dataServer.get(lishID);  // returns IStoredLISH | null
    if (!lish) throw new Error('LISH not found locally');
 
 3. Backend extracts summary from LISH manifest:
@@ -2025,13 +2028,12 @@ The publish flow (section 15.5) extracts CatalogEntry fields from ILISH. The exa
 ```typescript
 // shared/src/lish.ts — actual interface
 interface ILISH {
-  version: number;
   id: string;
   name?: string;         // optional — may be undefined
   description?: string;  // optional — may be undefined
   created: string;       // ISO 8601
   chunkSize: number;
-  checksumAlgo: HashAlgorithm;  // 'sha256' | 'xxhash' etc.
+  checksumAlgo: HashAlgorithm;  // 'sha256' | 'sha384' | 'sha512' etc.
   directories?: IDirectoryEntry[];
   files?: IFileEntry[];   // optional — may be undefined for metadata-only LISHs
   links?: ILinkEntry[];
@@ -2088,7 +2090,7 @@ function lishToCatalogEntry(
 - `lish.id` must be a valid UUID
 - `totalSize` must be > 0
 
-**Fields NOT copied from ILISH**: `directories`, `links`, `version`, `created` (LISH creation date is separate from catalog publish date). The full manifest is fetched on demand via `get_lish_req`.
+**Fields NOT copied from ILISH**: `directories`, `links`, `created` (LISH creation date is separate from catalog publish date). The full manifest is fetched on demand via `get_lish_req`.
 
 ### 16.2 Catalog Listing Pagination
 
@@ -2659,7 +2661,9 @@ backend/src/
 │   │                               registerTopicValidator(); update TopicHandler type to support async)
 │   └── network-config.ts   (EDIT: future — upgrade gossipsub D to >=6, add peer scoring)
 ├── lishnet/
-│   └── networks.ts         (EDIT: call catalogManager.join/leave on setEnabled)
+│   └── lishnets.ts         (EDIT: call catalogManager.join/leave on setEnabled)
+├── db/
+│   └── lishnets.ts         (EDIT: add owner_peer_id column via ALTER TABLE)
 └── app.ts                  (EDIT: create CatalogManager, pass to APIServer)
 
 frontend/src/
@@ -2673,7 +2677,7 @@ frontend/src/
 ```
 
 **Total new files**: 9 backend + 1 shared + 1 frontend script = 11 new files
-**Total edited files**: 7 (server.ts, network.ts, network-config.ts, networks.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
+**Total edited files**: 8 (server.ts, network.ts, network-config.ts, lishnet/lishnets.ts, db/lishnets.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
 
 ---
 
@@ -2887,7 +2891,7 @@ Existing networks have `.lishnet` files without `ownerPeerID`. Section 15.3 make
 Scenario: User has v1 .lishnet files (no ownerPeerID)
 
 1. User opens LiberShare v2 (with catalog support)
-2. Backend loads lishnets.json — detects entries without ownerPeerID
+2. Backend queries lishnets table — detects entries without ownerPeerID
 3. For each network where local peer is the creator:
    - UI shows notification: "Network X can be upgraded to support catalogs"
    - User confirms → backend sets ownerPeerID to local PeerID
