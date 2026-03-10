@@ -35,8 +35,32 @@ LiberShare currently has no way for peers to discover what content is available 
 | **Yjs** | Rejected | Collaborative editing tool, tombstone overhead unnecessary, poor documentation |
 | **GUN** | Rejected | Wall-clock LWW broken under clock skew, incompatible transport layer, requires separate relay infrastructure |
 | **Hypercore/Autobase** | Rejected | Hyperswarm incompatible with libp2p, Autobase immature (141 stars), no TypeScript |
-| **cr-sqlite** | Future option | Full SQL queries, but native binary distribution complexity, Bun extension loading untested |
-| **Custom 2P-Set CRDT** | **Selected** | Zero dependencies, fits existing libp2p stack perfectly, ~100 lines of code, full control over security |
+| **cr-sqlite** | Rejected | Transport-agnostic SQLite CRDT, but "assumes friendly actors", 2.5x write overhead, maintenance slowed |
+| **automerge-repo** | Rejected | Pluggable transport, actively maintained, but stores binary blobs — not queryable SQL tables |
+| **ElectricSQL** | Rejected | Requires central Electric server + Postgres — not P2P |
+| **libSQL/Turso** | Rejected | Single-writer remote primary — not P2P, no CRDT |
+| **PowerSync** | Rejected | Requires PowerSync Service — not P2P |
+| **Triplit** | Rejected | Requires Triplit server, WebSocket-only — not P2P |
+| **Jazz (CoJSON)** | Rejected | Requires Jazz sync server, no SQLite, no libp2p |
+| **Evolu** | Rejected | Single-user multi-device model, needs relay — wrong identity model for shared catalog |
+| **Ditto** | Rejected | Commercial closed-source, proprietary transport, no libp2p integration |
+| **RxDB** | Rejected | SQLite adapter is paywalled (paid subscription), WebRTC P2P needs signaling server |
+| **Custom 2P-Set CRDT** | **Selected** | Zero dependencies, fits existing libp2p + bun:sqlite stack, full control over untrusted-peer security |
+
+### Why No Library Works for Untrusted P2P
+
+A comprehensive evaluation of 14 CRDT/sync libraries (March 2026) revealed a universal gap: **no library provides Byzantine-safe CRDT for untrusted peers**. All assume collaborative/trusted participants.
+
+**cr-sqlite** (3.7k stars) is the closest — it provides transport-agnostic changesets as SQL rows via `crsql_changes` virtual table. However:
+- Its author explicitly states: *"crsqlite assumes friendly actors and needs to guard against malicious updates"*
+- Even with cr-sqlite, you must still implement: Ed25519 signature verification, ACL chain validation, HLC drift protection, rate limiting — which is 90% of the work
+- 2.5x write overhead vs plain SQLite (metadata tables + triggers for each CRR table)
+- Native extension loading in Bun (`db.loadExtension()`) is not production-tested for cr-sqlite
+- Development has slowed (last main branch commit May 2024, last release Jan 2025)
+
+**automerge-repo** (665 stars, actively maintained) has a clean pluggable NetworkAdapter for libp2p, but stores CRDT state as opaque binary documents — catalog search queries cannot run as SQL without a materialization layer.
+
+All server-dependent solutions (ElectricSQL, Turso, PowerSync, Triplit, Jazz, Evolu) are disqualified by the P2P requirement.
 
 ### Why Custom CRDT Wins
 
@@ -46,7 +70,9 @@ The catalog is semantically simple:
 - **Append-mostly** with rare deletions
 - **Small metadata** (~500 bytes per entry, full LISH fetched on demand)
 
-This is a **signed 2P-Set** (grow-only set of additions + grow-only set of deletions), the simplest possible CRDT. No library needed.
+This is a **signed 2P-Set** (grow-only set of additions + grow-only set of deletions), the simplest possible CRDT. The LWW merge is a single SQL `INSERT ON CONFLICT DO UPDATE WHERE` statement (see §6). No library needed.
+
+The hardest part of the implementation — untrusted peer security (signatures, ACL, anti-replay) — must be custom-built regardless of CRDT library choice. Since the CRDT itself is trivial (~150 lines of SQL functions), adding a library would increase complexity without reducing the security work.
 
 ---
 
@@ -1333,14 +1359,14 @@ Two different serialization contexts:
 |---|---|---|
 | **GossipSub messages** | JSON (utf-8) | Human-debuggable, gossipsub uses string payloads, signatures use canonical JSON (json-canonicalize) |
 | **Bilateral sync stream** | CBOR | Binary stream, larger payloads (deltas), bandwidth matters |
-| **Local persistence** | CBOR | Disk efficiency, native binary signatures |
+| **Local persistence** | SQLite + CBOR blob | Structured data in SQL columns, `signed_op` as CBOR blob for re-forwarding |
 
 GossipSub messages are small (single operations, ~500 bytes) so JSON overhead is acceptable. The signature is computed over **canonical JSON** regardless of wire format — this ensures signature portability between contexts.
 
 ```
 GossipSub:  peer → JSON.stringify(signedOp) → gossipsub.publish() → topic
 Bilateral:  peer → cbor.encode(delta) → libp2p stream → peer
-Disk:       cbor.encode(fullState) → Bun.write(file)
+Disk:       SQLite tables (entries, tombstones, ACL, clocks) + signed_op BLOB column
 ```
 
 ### 14.4 Update Merge Strategy — Per-Field or Whole Entry?
@@ -3190,11 +3216,11 @@ The implementation phases mention "unit tests" but don't specify what to test. H
 ```
 catalog/
 ├── __tests__/
-│   ├── catalog-crdt.test.ts       Core CRDT logic
+│   ├── catalog-crdt.test.ts       Core CRDT logic (LWW merge via SQL)
 │   ├── catalog-hlc.test.ts        HLC correctness
 │   ├── catalog-signer.test.ts     Signing and verification
-│   ├── catalog-persistence.test.ts  CBOR save/load
-│   └── catalog-validation.test.ts   Authorization and replay prevention
+│   ├── catalog-db.test.ts         SQLite persistence and FTS5
+│   └── catalog-validation.test.ts Authorization and replay prevention
 ```
 
 **Test categories and cases**:
@@ -3233,11 +3259,14 @@ catalog/
    - restricted mode: only moderator+ can add entries
    - cascading revocation: revoke admin → their moderators also revoked
 
-5. Persistence (catalog-persistence.test.ts)
-   - save + load round-trip: state matches
-   - corrupt main file: falls back to .tmp
-   - both files missing: returns null (fresh start)
-   - atomic write: .tmp exists during write, removed after rename
+5. SQLite Persistence (catalog-db.test.ts)
+   - schema creation: all 5 tables created correctly
+   - UPSERT LWW: higher HLC overwrites, lower HLC rejected
+   - FTS5 index: search by name/description/tags returns correct results
+   - FTS5 consistency: entry update also updates FTS index (single transaction)
+   - tombstone: entry removed from results after tombstone insert
+   - vector clock: persisted and loaded correctly on restart
+   - WAL mode: concurrent reads during write transaction
 
 6. Rate limiting (catalog-validation.test.ts)
    - 10 ops within 1 min: all accepted
@@ -3255,20 +3284,418 @@ catalog/
 
 ---
 
+## 19. Custom 2P-Set CRDT — Deep Implementation Analysis
+
+This section provides a comprehensive analysis of implementing a custom 2P-Set CRDT layer for the online catalog, covering architecture, implementation strategy, pitfalls, edge cases, and comparison with alternatives.
+
+### 19.1 Why Custom (Summary of Decision)
+
+After evaluating 14 libraries (§2), the conclusion is clear: **no existing library provides Byzantine-safe CRDT for untrusted P2P peers over SQLite with libp2p transport**. The closest candidate (cr-sqlite) explicitly assumes friendly actors and adds 2.5x write overhead. Since 90% of the work is security validation (signatures, ACL, anti-replay) regardless of CRDT library choice, and the CRDT itself is trivial (~150 lines of SQL), building custom is the correct approach.
+
+### 19.2 What is a 2P-Set?
+
+A **Two-Phase Set** (2P-Set) is one of the simplest CRDTs. It consists of two grow-only sets:
+
+```
+2P-Set = {
+  addSet:    Set<Element>    // elements that have been added
+  removeSet: Set<Element>    // elements that have been removed (tombstones)
+}
+
+lookup(e) = e ∈ addSet ∧ e ∉ removeSet
+add(e)    = addSet ∪ {e}
+remove(e) = removeSet ∪ {e}   // only if e ∈ addSet
+merge(a, b) = {
+  addSet:    a.addSet ∪ b.addSet,
+  removeSet: a.removeSet ∪ b.removeSet
+}
+```
+
+**Key property**: Once an element is removed, it can never be re-added (classic 2P-Set limitation). Our implementation relaxes this with **LWW (Last-Writer-Wins)** semantics: an element can be re-added if the new add has a higher HLC than the tombstone.
+
+### 19.3 Our Variant: Signed LWW 2P-Set
+
+The LiberShare catalog is NOT a pure 2P-Set. It's a **Signed LWW 2P-Set with ACL**, which adds several layers:
+
+```
+Standard 2P-Set:
+  addSet:    Set<Element>
+  removeSet: Set<Element>
+
+Our variant:
+  addSet:    Map<(networkID, lishID) → SignedCatalogEntry>   // LWW by HLC
+  removeSet: Map<(networkID, lishID) → SignedTombstone>      // LWW by HLC
+  aclSet:    Map<(networkID, peerID, role) → SignedACLOp>    // grant/revoke chain
+  clockSet:  Map<(networkID, peerID) → HLC>                  // vector clock for anti-replay
+
+  lookup(e)  = e ∈ addSet ∧ (e ∉ removeSet ∨ addSet[e].hlc > removeSet[e].hlc)
+  add(e)     = verify(sig) → checkACL → checkDrift → upsert if HLC > existing
+  remove(e)  = verify(sig) → checkACL → insert tombstone if HLC > existing add
+  merge(a,b) = for each entry: keep the one with higher HLC (deterministic tiebreak)
+```
+
+**Critical difference from textbook CRDT**: Every operation carries an Ed25519 signature and must pass a 5-step validation chain before being applied. The CRDT merge is trivial; the security layer is the real implementation.
+
+### 19.4 SQLite as CRDT State (Architecture)
+
+Instead of in-memory Maps materialized to disk, **SQLite IS the CRDT state**. The LWW merge is expressed as a single SQL statement:
+
+```
+                    ┌──────────────────────────┐
+                    │     SignedCatalogOp       │
+                    │  (from GossipSub/Sync)    │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │   Validation Chain        │
+                    │  1. Signature (Ed25519)   │
+                    │  2. ACL (role check)      │
+                    │  3. Drift (±5 min)        │
+                    │  4. Content (field sizes) │
+                    │  5. Anti-replay (HLC)     │
+                    └────────────┬─────────────┘
+                                 │ PASS
+                    ┌────────────▼─────────────┐
+                    │   SQL UPSERT with LWW    │
+                    │  INSERT ON CONFLICT DO    │
+                    │  UPDATE WHERE hlc > old   │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼─────────────┐
+                    │   SQLite (WAL mode)       │
+                    │  catalog_entries          │
+                    │  catalog_tombstones       │
+                    │  catalog_acl              │
+                    │  catalog_clocks           │
+                    │  catalog_fts (FTS5)       │
+                    └──────────────────────────┘
+```
+
+**Why this works**: The CRDT guarantee (convergence) requires only that all peers apply the same operations with the same merge function. The merge function (`INSERT ON CONFLICT DO UPDATE WHERE hlc > existing`) is deterministic. Two peers applying the same set of valid operations in any order will end up with the same SQLite state.
+
+### 19.5 Implementation Components
+
+The custom 2P-Set layer consists of these components:
+
+```
+db/catalog.ts              (~200 lines)  SQL schema + CRUD functions
+catalog/catalog-hlc.ts     (~80 lines)   HLC tick, merge, compare
+catalog/catalog-signer.ts  (~100 lines)  Ed25519 sign + verify
+catalog/catalog-validator.ts (~150 lines) 5-step validation chain
+catalog/catalog-manager.ts (~300 lines)  Lifecycle, sync triggers, API
+catalog/catalog-sync.ts    (~200 lines)  Bilateral sync stream handler
+```
+
+**Total**: ~1030 lines of TypeScript. This is less code than integrating cr-sqlite (~800 lines) + still needing the validator (~150 lines) + the signer (~100 lines) + glue code.
+
+#### Component Responsibilities
+
+| Component | Responsibility | Dependencies |
+|---|---|---|
+| `db/catalog.ts` | Schema creation, UPSERT with LWW, queries, FTS5 | `bun:sqlite` |
+| `catalog-hlc.ts` | HLC data structure, tick (local), merge (remote), compare | None |
+| `catalog-signer.ts` | `signCatalogOp()`, `verifyCatalogOp()` | `json-canonicalize`, `@libp2p/crypto` |
+| `catalog-validator.ts` | `handleRemoteOp()` — the 5-step chain | `catalog-signer`, `db/catalog` |
+| `catalog-manager.ts` | Per-network lifecycle, local clock, anti-entropy timer | All above |
+| `catalog-sync.ts` | Bilateral stream handler, delta exchange | `cbor-x`, `catalog-validator` |
+
+### 19.6 Implementation Pitfalls and Edge Cases
+
+#### Pitfall 1: HLC Monotonicity After Restart
+
+**Problem**: If the process crashes, the in-memory HLC is lost. On restart, `Date.now()` might return a value lower than the last HLC's wallTime (e.g., NTP adjustment). New operations would have a lower HLC than previous ones → rejected by peers as replay.
+
+**Solution**: Persist the latest local HLC in `catalog_clocks` table. On startup, load it and use `max(persisted.wallTime, Date.now())` as the starting point.
+
+```typescript
+function initLocalClock(db: Database, networkID: string, localPeerID: string): HLC {
+  const persisted = getLatestClock(db, networkID, localPeerID);
+  const now = Date.now();
+  if (persisted && persisted.wallTime >= now) {
+    // Clock went backwards (NTP adjustment) — use persisted + bump logical
+    return { wallTime: persisted.wallTime, logical: persisted.logical + 1, nodeID: localPeerID };
+  }
+  return { wallTime: now, logical: 0, nodeID: localPeerID };
+}
+```
+
+#### Pitfall 2: Tombstone GC and Late-Joining Peers
+
+**Problem**: Tombstones are garbage-collected after 30 days. A peer that was offline for >30 days rejoins and sends an `add` operation for an entry that was deleted. Without the tombstone, other peers re-accept the deleted entry.
+
+**Solution**: During bilateral sync, include a `gcCutoff` timestamp in the sync response. The syncing peer knows that any entries deleted before `gcCutoff` may have been garbage-collected. For entries older than `gcCutoff` not in the current catalog, the peer should NOT re-broadcast its local copy.
+
+```typescript
+interface SyncResponse {
+  entries: SignedCatalogOp[];    // current entries
+  tombstones: SignedCatalogOp[]; // active tombstones
+  gcCutoff: number;              // entries deleted before this were GC'd
+}
+```
+
+**Residual risk**: A malicious peer can still re-inject a GC'd entry by crafting a new `add` op with a fresh HLC. This is acceptable because:
+- They need moderator permissions (ACL check still applies)
+- The re-added entry gets a new HLC (not the original) — it's effectively a new entry
+- Other moderators can remove it again
+
+#### Pitfall 3: Concurrent ACL and Data Operations
+
+**Problem**: A batch of operations arrives from a peer after reconnect. The batch contains an `acl_revoke` for moderator X and several `add` operations from moderator X. Processing order matters.
+
+**Solution**: **Power-events-first rule** (Matrix pattern). Sort incoming batches: ACL operations first, then data operations. Within each group, sort by HLC.
+
+```typescript
+function processBatch(db: Database, networkID: string, ops: SignedCatalogOp[]): void {
+  // Partition into ACL ops and data ops
+  const aclOps = ops.filter(op => op.payload.type.startsWith('acl_'));
+  const dataOps = ops.filter(op => !op.payload.type.startsWith('acl_'));
+
+  // Process ACL first (may change who is authorized)
+  for (const op of aclOps.sort(byHLC)) {
+    handleRemoteOp(db, networkID, op);
+  }
+
+  // Then data ops (checked against updated ACL)
+  for (const op of dataOps.sort(byHLC)) {
+    handleRemoteOp(db, networkID, op);
+  }
+}
+```
+
+#### Pitfall 4: FTS5 Index Consistency
+
+**Problem**: FTS5 is a separate virtual table. If a crash occurs between updating `catalog_entries` and updating `catalog_fts`, the index becomes inconsistent with the data.
+
+**Solution**: Use a single SQL transaction that updates both tables atomically. SQLite WAL ensures either both writes succeed or neither does.
+
+```typescript
+function upsertCatalogEntry(db: Database, networkID: string, op: SignedCatalogOp): void {
+  db.transaction(() => {
+    // 1. UPSERT into catalog_entries (LWW merge)
+    upsertEntryStmt.run(/* ... */);
+
+    // 2. Update FTS5 index
+    // DELETE old entry from FTS (if exists), INSERT new
+    deleteFtsStmt.run(networkID, op.payload.data.lishID);
+    insertFtsStmt.run(networkID, op.payload.data.lishID, op.payload.data.name, op.payload.data.description, op.payload.data.tags);
+  })();
+}
+```
+
+#### Pitfall 5: `signed_op` BLOB Preservation
+
+**Problem**: During bilateral sync, peers must forward the original `SignedCatalogOp` envelope — not re-signed copies. If the BLOB is decoded, modified (even accidentally), and re-encoded, the signature becomes invalid.
+
+**Solution**: Store the raw CBOR bytes as-is in the `signed_op` BLOB column. Never decode the BLOB for forwarding — pass it directly from SQLite to the sync stream.
+
+```typescript
+// CORRECT: pass raw BLOB to sync
+const rows = db.query('SELECT signed_op FROM catalog_entries WHERE network_id = ? AND hlc_wall > ?').all(networkID, since);
+for (const row of rows) {
+  stream.write(row.signed_op); // raw bytes, no decode/re-encode
+}
+
+// WRONG: decode then re-encode (signature breaks if cbor-x adds/reorders fields)
+// const op = cbor.decode(row.signed_op);
+// stream.write(cbor.encode(op)); // ← signature may be invalid!
+```
+
+#### Pitfall 6: SQLite Busy/Locked Errors
+
+**Problem**: Multiple async operations (GossipSub handler, bilateral sync, API request) write to the catalog tables concurrently. SQLite WAL mode allows concurrent reads but writes are serialized. Under load, writes can get `SQLITE_BUSY`.
+
+**Solution**: `bun:sqlite` handles WAL serialization internally. For burst situations (bilateral sync receiving hundreds of entries), batch operations into a single transaction:
+
+```typescript
+function applyDelta(db: Database, networkID: string, ops: SignedCatalogOp[]): number {
+  let applied = 0;
+  db.transaction(() => {
+    for (const op of ops) {
+      if (handleRemoteOp(db, networkID, op)) applied++;
+    }
+  })();
+  return applied;
+}
+```
+
+#### Pitfall 7: Vector Clock Size Growth
+
+**Problem**: The `catalog_clocks` table grows with one row per `(network_id, peer_id)`. In a network with thousands of transient peers, this table grows unbounded.
+
+**Solution**: GC stale clock entries for peers not seen in 30 days (same as tombstone GC). If a stale peer reconnects, they trigger a full bilateral sync instead of delta sync — acceptable because it's rare.
+
+```sql
+DELETE FROM catalog_clocks
+WHERE network_id = ? AND last_seen < datetime('now', '-30 days');
+```
+
+### 19.7 Convergence Proof (Informal)
+
+For two peers A and B to converge, they must reach the same state after exchanging all operations. Our system guarantees this because:
+
+1. **Deterministic merge**: `INSERT ON CONFLICT DO UPDATE WHERE hlc > existing` is a pure function of (current_state, incoming_op). Given the same inputs, it produces the same output.
+
+2. **Deterministic tiebreaking**: When `hlc_wall` and `hlc_logical` are equal, `hlc_node` (PeerID string comparison) provides a total order. No ambiguity.
+
+3. **Commutativity**: For any two valid operations op1 and op2 on different keys `(networkID, lishID)`, applying op1 then op2 produces the same state as op2 then op1. For operations on the same key, LWW picks the higher HLC regardless of application order.
+
+4. **Idempotency**: Applying the same operation twice produces the same result as applying it once (SQL `ON CONFLICT DO UPDATE WHERE hlc > existing` — second application has `hlc = existing`, condition fails, no change).
+
+5. **Associativity**: Merging states `(A merge B) merge C = A merge (B merge C)` — each key independently resolves to the highest-HLC value.
+
+**Caveat**: Convergence holds only for operations that **pass validation**. If peer A accepts an operation that peer B rejects (different ACL state), they diverge. The power-events-first rule and bilateral sync protocol mitigate this by ensuring ACL state converges first.
+
+### 19.8 Comparison: Custom vs Library (Effort Breakdown)
+
+| Work Item | Custom 2P-Set | cr-sqlite | automerge-repo |
+|---|---|---|---|
+| Schema design | ~200 lines SQL | ~50 lines (CRR declarations) | N/A (opaque docs) |
+| LWW merge logic | ~30 lines (SQL UPSERT) | Built-in (hidden in triggers) | Built-in |
+| HLC implementation | ~80 lines | Need custom (cr-sqlite uses Lamport) | Built-in (but not HLC) |
+| Ed25519 signing | ~100 lines | **Still needed** | **Still needed** |
+| Validation chain | ~150 lines | **Still needed** | **Still needed** |
+| ACL enforcement | ~100 lines (in validator) | **Still needed** | **Still needed** |
+| Anti-replay | ~50 lines (vector clock) | **Still needed** | Built-in (but no Byzantine) |
+| FTS5 search | Built-in (SQL trigger) | Extra setup needed | Not available |
+| Bilateral sync | ~200 lines | ~100 lines (changeset API) | Built-in (NetworkAdapter) |
+| Manager lifecycle | ~300 lines | ~200 lines | ~200 lines |
+| Native extension loading | N/A | ~50 lines + risk | N/A |
+| Materialization layer | N/A | N/A | ~300 lines (doc → SQL) |
+| **Total** | **~1030 lines** | **~950 lines + native ext risk** | **~1050 lines + no SQL search** |
+| **Security coverage** | Full | Partial (no Byzantine) | Partial (no Byzantine) |
+| **Dependencies added** | 0 (bun:sqlite) | 1 native ext (~2MB) | 1 pkg (~604KB WASM) |
+| **Debug/audit** | Full visibility | Opaque triggers | Opaque binary state |
+
+**Conclusion**: Custom implementation is roughly the same amount of code as any library integration, but with full security coverage, zero new dependencies, full debuggability, and no native extension risk.
+
+### 19.9 What Can Go Wrong (Risk Analysis)
+
+| Risk | Severity | Likelihood | Mitigation |
+|---|---|---|---|
+| HLC drift causes permanent ordering issues | High | Low | ±5 min drift guard, NTP recommended in docs |
+| Tombstone GC causes entry resurrection | Medium | Medium | `gcCutoff` in sync, re-add requires fresh ACL check |
+| FTS5 out of sync with entries | High | Low | Single transaction for entry + FTS updates |
+| `signed_op` BLOB corruption on re-encode | High | Medium | Never decode BLOBs for forwarding, pass raw bytes |
+| SQLite BUSY under concurrent sync | Medium | Medium | Batch writes in transactions, WAL mode |
+| Vector clock table unbounded growth | Low | Medium | 30-day GC for stale peers |
+| ACL state divergence between peers | High | Low | Power-events-first, bilateral sync includes ACL ops |
+| Memory usage for large catalogs | Low | Low | SQLite handles this — no in-memory state beyond prepared stmts |
+| Bug in LWW merge SQL | Critical | Low | Extensive unit tests (§18.3), property-based testing |
+| Ed25519 key loss by owner | Critical | Medium | User documentation, future: multi-sig ownership |
+
+### 19.10 Implementation Order (Recommended)
+
+Phase 1 implementation should follow this order to minimize integration risk:
+
+```
+Step 1: catalog-hlc.ts + tests
+  - Pure functions, no dependencies
+  - Easy to test in isolation
+  - Foundation for everything else
+
+Step 2: db/catalog.ts + tests
+  - Schema creation (5 tables)
+  - UPSERT with LWW merge
+  - Query functions
+  - FTS5 index maintenance
+  - Test with mock data (no signing yet)
+
+Step 3: catalog-signer.ts + tests
+  - signCatalogOp() and verifyCatalogOp()
+  - Depends on: catalog-hlc (for HLC in payload)
+  - Test: sign → verify round-trip, tampered payload, wrong key
+
+Step 4: catalog-validator.ts + tests
+  - handleRemoteOp() — the 5-step chain
+  - Depends on: catalog-signer, db/catalog
+  - Test: each validation step independently, then full chain
+
+Step 5: catalog-manager.ts
+  - Lifecycle: init per-network state on join, cleanup on leave
+  - Local clock management (load from DB, tick, persist)
+  - Anti-entropy timer (periodic bilateral sync trigger)
+  - API methods (list, get, search, publish, remove)
+
+Step 6: catalog-sync.ts (Phase 2)
+  - Bilateral sync stream handler
+  - Delta exchange based on vector clocks
+  - gcCutoff handling
+  - Depends on: catalog-validator (to validate incoming ops)
+```
+
+**Key principle**: Each step is independently testable. Steps 1-4 have no network dependencies — they can be tested with a pure in-memory SQLite database and generated Ed25519 keys.
+
+### 19.11 Alternatives Considered and Rejected
+
+#### Alternative A: Event Sourcing (Append-Only Log)
+
+Store all operations in an append-only log, replay to compute current state.
+
+**Pros**: Complete audit trail, easy to debug, natural fit for CRDT.
+**Cons**: Log grows forever, replay on startup becomes slow, need compaction (which is equivalent to maintaining materialized state — back to our approach).
+
+**Verdict**: Our `signed_op` BLOB column gives us the audit trail benefit without the replay cost. The materialized columns (`name`, `description`, etc.) are the compacted state.
+
+#### Alternative B: Merkle-DAG (IPFS-style)
+
+Store entries as content-addressed blocks in a Merkle DAG, like IPFS Cluster's go-ds-crdt.
+
+**Pros**: Built-in integrity verification, natural deduplication.
+**Cons**: Requires IPFS/Helia integration (rejected in §2), content-addressed blocks can't be queried by SQL, no FTS5, would need a separate materialization layer.
+
+**Verdict**: Adds massive complexity for no benefit. Our catalog entries are mutable (LWW updates) — content addressing doesn't fit naturally.
+
+#### Alternative C: CRDTs Per-Field (MVRegister)
+
+Use a Multi-Value Register per field, allowing concurrent edits to different fields to merge without conflict.
+
+**Pros**: No lost updates when editing different fields concurrently.
+**Cons**: Complexity explosion — need to track HLC per field per entry, signature must cover individual fields, merge function becomes much more complex, `catalog_entries` table would need `hlc_wall_name`, `hlc_logical_name`, `hlc_wall_description`, etc.
+
+**Verdict**: Overkill. Concurrent edits to different fields of the same catalog entry are extremely rare (moderators coordinating). The LWW whole-entry approach (§14.4) is the right trade-off.
+
+#### Alternative D: Operation-Based CRDT (CmRDT)
+
+Instead of state-based merge, use operation-based CRDT where operations are delivered exactly-once in causal order.
+
+**Pros**: Smaller messages (just the operation, not the state).
+**Cons**: Requires reliable causal broadcast (exactly-once + causal ordering). GossipSub provides at-least-once with no ordering guarantees. Building causal broadcast on top of gossipsub is a research problem, not an engineering task.
+
+**Verdict**: Our state-based approach (merge any state, any order, converge) is robust to GossipSub's delivery semantics. The `signed_op` blob is operation-sized, so we get the bandwidth benefit of CmRDT without the delivery requirements.
+
+### 19.12 Performance Characteristics
+
+| Operation | Expected Performance | Bottleneck |
+|---|---|---|
+| Local add/update/remove | <1ms | Ed25519 sign (~0.1ms) + SQL INSERT |
+| Remote op validation | <1ms | Ed25519 verify (~0.2ms) + 4 SQL lookups |
+| Bilateral sync (1000 entries) | ~200ms | CBOR decode + 1000× validation + batch INSERT |
+| FTS5 search | <10ms | SQLite FTS5 query (well-optimized for this scale) |
+| Catalog list (page of 50) | <1ms | Simple SELECT with LIMIT/OFFSET |
+| Tombstone GC | <10ms | Single DELETE statement |
+| Anti-entropy check | <1ms | Compare vector clock timestamps |
+
+**Scale expectations**: Catalogs of 1K-10K entries are the target range. At 10K entries with ~500 bytes metadata each, the `catalog_entries` table is ~5 MB + `signed_op` BLOBs ~5 MB = ~10 MB total. Well within SQLite's comfort zone.
+
+**Memory footprint**: Unlike in-memory CRDT approaches, the only memory used is SQLite's page cache (configurable, default ~2 MB) plus prepared statement handles. No `Map<string, CatalogEntry>` in heap.
+
+---
+
 ## Document Status
 
 **All identified design questions have been resolved.** This document covers:
 
-- Technology selection and rationale (section 2)
+- Technology selection with 14 library evaluations (section 2)
 - Complete data model with interfaces (section 3)
-- Security model with signing, ACL, and validation (sections 4, 11)
-- Sync protocol with two layers (section 5)
-- Crash-safe CBOR persistence (section 6)
+- Security model with signing, ACL, HLC, and untrusted-peer validation (sections 4, 11)
+- Sync protocol with two layers — GossipSub + bilateral stream (section 5)
+- SQLite persistence with LWW merge via UPSERT (section 6)
 - API surface and events (section 7)
 - Implementation phases (section 9)
-- Security checklist (section 10)
+- Security checklist — 30+ items (section 10)
 - Integration with existing codebase (sections 15-16)
 - Hardening: GC, rate limits, topic validators, error handling (section 17)
 - CRDT merge implementation, spam protection, testing (section 18)
+- Custom 2P-Set deep analysis: architecture, pitfalls, convergence, performance (section 19)
 
 **Ready for Phase 1 implementation.**
