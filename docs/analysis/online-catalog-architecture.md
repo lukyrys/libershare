@@ -1,6 +1,6 @@
 # LiberShare Online Catalog (DB LISHs) - Architecture Analysis
 
-**Date**: 2026-02-28 (updated 2026-03-10)
+**Date**: 2026-02-28 (updated 2026-03-15)
 **Branch**: `feat/online-db`
 **Status**: Complete — ready for Phase 1 implementation
 **Author**: Analysis by Claude, discussed with Jiri Kreibich
@@ -1093,10 +1093,10 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [ ] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
 - [ ] Bilateral sync: stream timeout (30s), payload size limit (10 MB), CBOR decode error handling
 - [ ] Bilateral sync: invalid signatures in delta → reject entries, penalize peer (P5 score -5)
-- [ ] Crash-safe persistence: write-then-rename (atomic write via .tmp file)
-- [ ] Corrupt catalog file: fallback to .tmp, then full sync from peers
+- [ ] Crash-safe persistence: SQLite WAL mode ensures atomic writes
+- [ ] Corrupt database: SQLite WAL recovery, fallback to full sync from peers
 - [ ] Per-network operation queue: serialized mutations prevent concurrent state corruption
-- [ ] Debounced persistence: max 1 disk write per 500ms, flush on shutdown
+- [ ] SQLite transactions: each mutation is atomic, WAL mode handles concurrent access
 - [ ] .lishnet `ownerPeerID` field: required for catalog, validated as Ed25519 PeerID
 - [ ] `manifestHash` computed as sha256(canonicalize(lishManifest)) — anchors catalog entry to exact manifest
 - [ ] `signCatalogOp()` receives `localClock` as parameter, returns `updatedClock` (no free variables)
@@ -1668,8 +1668,8 @@ async start(bootstrapPeers: string[] = []): Promise<void> {
 }
 
 getPrivateKey(): Ed25519PrivateKey {
-  if (!this.privateKey) throw new Error('Network not started');
-  if (this.privateKey.type !== 'Ed25519') throw new Error('Only Ed25519 keys supported');
+  if (!this.privateKey) throw new CodedError(ErrorCodes.NETWORK_NOT_STARTED);
+  if (this.privateKey.type !== 'Ed25519') throw new CodedError(ErrorCodes.INTERNAL_ERROR, 'Only Ed25519 keys supported');
   return this.privateKey as Ed25519PrivateKey;
 }
 ```
@@ -1686,7 +1686,7 @@ async registerStreamHandler(
   protocol: string,
   handler: (stream: Stream) => Promise<void>
 ): Promise<void> {
-  if (!this.node) throw new Error('Network not started');
+  if (!this.node) throw new CodedError(ErrorCodes.NETWORK_NOT_STARTED);
   await this.node.handle(
     protocol,
     async ({ stream }) => handler(stream),
@@ -1696,6 +1696,28 @@ async registerStreamHandler(
 ```
 
 This mirrors the existing `LISH_PROTOCOL` handler registration pattern in `start()` (line 194-199 of `network.ts`).
+
+**3. PeerID-based dial for bilateral sync**
+
+The existing `Network.dialProtocol(multiaddrs[], protocol)` takes multiaddrs. Bilateral sync needs to dial by PeerID (from `getTopicPeers()`). Two options:
+
+```typescript
+// Option A: New convenience method on Network class
+async dialProtocolByPeerId(peerID: string, protocol: string): Promise<Stream> {
+  if (!this.node) throw new CodedError(ErrorCodes.NETWORK_NOT_STARTED);
+  const peerId = peerIdFromString(peerID);
+  const connection = await this.node.dial(peerId);
+  return connection.newStream(protocol, { runOnLimitedConnection: true });
+}
+
+// Option B: Resolve in catalog-sync.ts (no Network change needed)
+const peerId = peerIdFromString(peerID);
+const connection = await network.node.dial(peerId);  // needs node to be accessible
+```
+
+Option A is preferred — keeps `node` private, consistent with existing patterns.
+
+**Note on error handling**: The codebase now uses `CodedError` from `shared/src/errors.ts` for structured error codes (added in main). New catalog methods should follow the same pattern — use `CodedError(ErrorCodes.*)` instead of `new Error()`. Catalog-specific error codes (e.g., `CATALOG_NOT_FOUND`, `CATALOG_ACL_DENIED`, `CATALOG_ENTRY_EXISTS`) should be added to `shared/src/errors.ts`.
 
 ### 15.5 End-to-End Publish Flow
 
@@ -2052,7 +2074,7 @@ Maximum one disk write per 500ms regardless of incoming operation rate. On shutd
 
 ## 16. Open Design Questions — End-to-End Integration (Resolved)
 
-Analysis of shared types (`shared/src/lish.ts`, `shared/src/index.ts`), API server pattern (`api/server.ts`), frontend Products page (`Products.svelte`), and DataServer reveals these remaining integration gaps.
+Analysis of shared types (`shared/src/lish.ts`, `shared/src/index.ts`), API server pattern (`api/api.ts`), frontend Products page (`Products.svelte`), and DataServer reveals these remaining integration gaps.
 
 ### 16.1 ILISH → CatalogEntry Field Mapping
 
@@ -2061,6 +2083,7 @@ The publish flow (section 15.5) extracts CatalogEntry fields from ILISH. The exa
 ```typescript
 // shared/src/lish.ts — actual interface
 interface ILISH {
+  version: number;
   id: string;
   name?: string;         // optional — may be undefined
   description?: string;  // optional — may be undefined
@@ -2070,6 +2093,13 @@ interface ILISH {
   directories?: IDirectoryEntry[];
   files?: IFileEntry[];   // optional — may be undefined for metadata-only LISHs
   links?: ILinkEntry[];
+}
+
+// ILISHSummary now includes verification status (added in main)
+interface ILISHSummary {
+  // ... existing fields ...
+  verifiedChunks: number;    // NEW — chunks verified via integrity check
+  totalChunks: number;       // NEW — total chunks in LISH
 }
 
 interface IFileEntry {
@@ -2596,7 +2626,7 @@ export function initCatalogHandlers(
 }
 ```
 
-**Registration in `server.ts`** (following existing pattern):
+**Registration in `api.ts`** (following existing pattern):
 
 ```typescript
 const _catalog = initCatalogHandlers(catalogManager, this.dataServer);
@@ -2686,10 +2716,10 @@ backend/src/
 │   └── catalog-sync.ts     (NEW: bilateral sync stream handler + initiator)
 ├── api/
 │   ├── catalog.ts          (NEW: initCatalogHandlers — WebSocket API)
-│   └── server.ts           (EDIT: register catalog handlers, inject CatalogManager)
+│   └── api.ts              (EDIT: register catalog handlers, inject CatalogManager)
 ├── protocol/
 │   ├── network.ts          (EDIT: add getPrivateKey(), registerStreamHandler(), dialProtocolByPeerId(),
-│   │                               registerTopicValidator(); update TopicHandler type to support async)
+│   │                               registerTopicValidator(); already uses CodedError for errors)
 │   └── network-config.ts   (EDIT: future — upgrade gossipsub D to >=6, add peer scoring)
 ├── lishnet/
 │   └── lishnets.ts         (EDIT: call catalogManager.join/leave on setEnabled)
@@ -2709,7 +2739,7 @@ frontend/src/
 ```
 
 **Total new files**: 7 backend + 1 shared + 1 frontend script = 9 new files
-**Total edited files**: 9 (server.ts, network.ts, network-config.ts, lishnet/lishnets.ts, db/lishnets.ts, db/database.ts, app.ts, shared/index.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
+**Total edited files**: 10 (api.ts, network.ts, network-config.ts, lishnet/lishnets.ts, db/lishnets.ts, db/database.ts, app.ts, shared/index.ts, shared/errors.ts, Products.svelte) + 2 frontend edits (ProductsItem.svelte, Product.svelte)
 
 ---
 
