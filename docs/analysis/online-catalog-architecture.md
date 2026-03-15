@@ -1073,7 +1073,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [x] Maximum catalog size enforced to prevent DoS via catalog spam
 - [x] Reject operations from unknown/unverified PeerIDs
 - [x] Log and alert on repeated authorization failures (potential attack)
-- [ ] GossipSub peer scoring enabled (P4 invalid messages + P5 app-specific + P6 IP colocation)
+- [x] GossipSub peer scoring enabled (P4 invalid messages + P5 app-specific + P6 IP colocation)
 - [x] GossipSub D >= 6 (upgraded from D=2)
 - [x] Per-publisher write quota enforced (MAX_ENTRIES_PER_PUBLISHER)
 - [x] Global catalog size cap enforced (MAX_CATALOG_SIZE)
