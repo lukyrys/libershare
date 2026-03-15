@@ -1072,7 +1072,7 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [x] Rate limiting on incoming operations per peer (sliding window)
 - [x] Maximum catalog size enforced to prevent DoS via catalog spam
 - [x] Reject operations from unknown/unverified PeerIDs
-- [ ] Log and alert on repeated authorization failures (potential attack)
+- [x] Log and alert on repeated authorization failures (potential attack)
 - [ ] GossipSub peer scoring enabled (P4 invalid messages + P5 app-specific + P6 IP colocation)
 - [x] GossipSub D >= 6 (upgraded from D=2)
 - [x] Per-publisher write quota enforced (MAX_ENTRIES_PER_PUBLISHER)
@@ -1089,8 +1089,8 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [x] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
 - [x] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
 - [x] Field size limits enforced before signature verification (fail fast)
-- [ ] Schema version included in catalog tables and sync protocol
-- [ ] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
+- [x] Schema version included in catalog tables and sync protocol
+- [x] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
 - [x] Bilateral sync: stream timeout (30s), payload size limit (10 MB), CBOR decode error handling
 - [ ] Bilateral sync: invalid signatures in delta → reject entries, penalize peer (P5 score -5)
 - [x] Crash-safe persistence: SQLite WAL mode ensures atomic writes
@@ -1098,14 +1098,14 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 - [x] Per-network operation queue: serialized mutations prevent concurrent state corruption
 - [x] SQLite transactions: each mutation is atomic, WAL mode handles concurrent access
 - [x] .lishnet `ownerPeerID` field: required for catalog, validated as Ed25519 PeerID
-- [ ] `manifestHash` computed as sha256(canonicalize(lishManifest)) — anchors catalog entry to exact manifest
+- [x] `manifestHash` computed as sha256(canonicalize(lishManifest)) — anchors catalog entry to exact manifest
 - [x] `signCatalogOp()` receives `localClock` as parameter, returns `updatedClock` (no free variables)
 - [x] Tombstone GC: 30-day retention, runs on anti-entropy cycle, `gcCutoff` in sync response
 - [x] Rate limiter: 10 ops/peer/min, 100 ops/global/min, 1000 entries/publisher, 50K entries/catalog
 - [x] GossipSub topic validator: REJECT invalid sigs, IGNORE rate-limited, Accept valid
 - [x] Structured error codes (CatalogError class) — frontend can switch on `error.code`
 - [x] Graceful degradation: catalog failures never block file sharing operations
-- [ ] v1 .lishnet upgrade: prompt-based ownerPeerID assignment with re-export
+- [x] v1 .lishnet upgrade: auto-assign ownerPeerID from local peer when creating network
 
 ---
 
