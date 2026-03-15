@@ -1060,51 +1060,51 @@ The Products page (`frontend/src/pages/Products/Products.svelte`) currently show
 
 ## 10. Security Checklist
 
-- [ ] Every catalog operation is signed with Ed25519
-- [ ] Signature covers payload + authorPeerID + HLC (canonical JSON via json-canonicalize)
-- [ ] ACL changes validated against role hierarchy before application
-- [ ] HLC anti-replay check on every received operation (hlcCompare > 0)
-- [ ] HLC clock drift check: reject ops with wallTime > 5 minutes in the future (MAX_DRIFT)
-- [ ] Owner PeerID is immutable (from .lishnet config, not from network)
-- [ ] Bilateral sync stream authenticated via libp2p Noise handshake
+- [x] Every catalog operation is signed with Ed25519
+- [x] Signature covers payload + authorPeerID + HLC (canonical JSON via json-canonicalize)
+- [x] ACL changes validated against role hierarchy before application
+- [x] HLC anti-replay check on every received operation (hlcCompare > 0)
+- [x] HLC clock drift check: reject ops with wallTime > 5 minutes in the future (MAX_DRIFT)
+- [x] Owner PeerID is immutable (from .lishnet config, not from network)
+- [x] Bilateral sync stream authenticated via libp2p Noise handshake
 - [ ] Cross-validate catalog state from multiple peers on initial sync
-- [ ] Tombstones kept for minimum 30 days (time-based GC)
-- [ ] Rate limiting on incoming operations per peer (sliding window)
-- [ ] Maximum catalog size enforced to prevent DoS via catalog spam
-- [ ] Reject operations from unknown/unverified PeerIDs
+- [x] Tombstones kept for minimum 30 days (time-based GC)
+- [x] Rate limiting on incoming operations per peer (sliding window)
+- [x] Maximum catalog size enforced to prevent DoS via catalog spam
+- [x] Reject operations from unknown/unverified PeerIDs
 - [ ] Log and alert on repeated authorization failures (potential attack)
 - [ ] GossipSub peer scoring enabled (P4 invalid messages + P5 app-specific + P6 IP colocation)
-- [ ] GossipSub D >= 6 (current D=2 is below spec minimum)
-- [ ] Per-publisher write quota enforced (MAX_ENTRIES_PER_PUBLISHER)
-- [ ] Global catalog size cap enforced (MAX_CATALOG_SIZE)
-- [ ] Sliding-window rate limiter per publisher PeerID
-- [ ] vectorClock persisted in catalog_clocks table and loaded on restart (prevents replay after restart)
-- [ ] GossipSub topic validator registered for catalog topics (REJECT invalid sigs, IGNORE rate-limited)
+- [x] GossipSub D >= 6 (upgraded from D=2)
+- [x] Per-publisher write quota enforced (MAX_ENTRIES_PER_PUBLISHER)
+- [x] Global catalog size cap enforced (MAX_CATALOG_SIZE)
+- [x] Sliding-window rate limiter per publisher PeerID
+- [x] vectorClock persisted in catalog_clocks table and loaded on restart (prevents replay after restart)
+- [x] GossipSub topic validator registered for catalog topics (REJECT invalid sigs, IGNORE rate-limited)
 - [ ] Content availability verification via random chunk challenge (optional, Phase 4)
-- [ ] Emergency revocation: acl_revoke propagates within 1 heartbeat cycle
-- [ ] Anti-escalation rule: cannot grant permissions you do not hold (Matrix Rule 9)
-- [ ] Power-events-first ordering: ACL events processed before catalog events in same batch
-- [ ] Cascading revocation: revoking admin invalidates all their granted moderator permissions
-- [ ] Update operations: only editable fields (name, description, contentType, tags) can be changed
-- [ ] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
-- [ ] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
-- [ ] Field size limits enforced before signature verification (fail fast)
+- [x] Emergency revocation: acl_revoke propagates within 1 heartbeat cycle
+- [x] Anti-escalation rule: cannot grant permissions you do not hold (Matrix Rule 9)
+- [x] Power-events-first ordering: ACL events processed before catalog events in same batch
+- [x] Cascading revocation: revoking admin invalidates all their granted moderator permissions
+- [x] Update operations: only editable fields (name, description, contentType, tags) can be changed
+- [x] Update operations: immutable fields (lishID, publisherPeerID, totalSize, manifestHash, etc.) rejected
+- [x] Update operations: lastEditedBy set automatically from authorPeerID, not user-supplied
+- [x] Field size limits enforced before signature verification (fail fast)
 - [ ] Schema version included in catalog tables and sync protocol
 - [ ] Unknown gossipsub message versions: IGNORE (not REJECT) to avoid penalizing newer peers
-- [ ] Bilateral sync: stream timeout (30s), payload size limit (10 MB), CBOR decode error handling
+- [x] Bilateral sync: stream timeout (30s), payload size limit (10 MB), CBOR decode error handling
 - [ ] Bilateral sync: invalid signatures in delta → reject entries, penalize peer (P5 score -5)
-- [ ] Crash-safe persistence: SQLite WAL mode ensures atomic writes
-- [ ] Corrupt database: SQLite WAL recovery, fallback to full sync from peers
-- [ ] Per-network operation queue: serialized mutations prevent concurrent state corruption
-- [ ] SQLite transactions: each mutation is atomic, WAL mode handles concurrent access
-- [ ] .lishnet `ownerPeerID` field: required for catalog, validated as Ed25519 PeerID
+- [x] Crash-safe persistence: SQLite WAL mode ensures atomic writes
+- [x] Corrupt database: SQLite WAL recovery, fallback to full sync from peers
+- [x] Per-network operation queue: serialized mutations prevent concurrent state corruption
+- [x] SQLite transactions: each mutation is atomic, WAL mode handles concurrent access
+- [x] .lishnet `ownerPeerID` field: required for catalog, validated as Ed25519 PeerID
 - [ ] `manifestHash` computed as sha256(canonicalize(lishManifest)) — anchors catalog entry to exact manifest
-- [ ] `signCatalogOp()` receives `localClock` as parameter, returns `updatedClock` (no free variables)
-- [ ] Tombstone GC: 30-day retention, runs on anti-entropy cycle, `gcCutoff` in sync response
-- [ ] Rate limiter: 10 ops/peer/min, 100 ops/global/min, 1000 entries/publisher, 50K entries/catalog
-- [ ] GossipSub topic validator: REJECT invalid sigs, IGNORE rate-limited, Accept valid
-- [ ] Structured error codes (CatalogError class) — frontend can switch on `error.code`
-- [ ] Graceful degradation: catalog failures never block file sharing operations
+- [x] `signCatalogOp()` receives `localClock` as parameter, returns `updatedClock` (no free variables)
+- [x] Tombstone GC: 30-day retention, runs on anti-entropy cycle, `gcCutoff` in sync response
+- [x] Rate limiter: 10 ops/peer/min, 100 ops/global/min, 1000 entries/publisher, 50K entries/catalog
+- [x] GossipSub topic validator: REJECT invalid sigs, IGNORE rate-limited, Accept valid
+- [x] Structured error codes (CatalogError class) — frontend can switch on `error.code`
+- [x] Graceful degradation: catalog failures never block file sharing operations
 - [ ] v1 .lishnet upgrade: prompt-based ownerPeerID assignment with re-export
 
 ---
