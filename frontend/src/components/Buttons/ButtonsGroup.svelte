@@ -26,16 +26,16 @@
 	let buttons: { onConfirm?: (() => void) | undefined }[] = [];
 	let active = $derived($activeArea === areaID);
 	let itemsElement = $state<HTMLElement | null>(null);
-	// @ts-ignore used via bind:this in template
+	// @ts-expect-error used via bind:this in template
 	let wrapperElement = $state<HTMLElement | null>(null);
 	let translateX = $state(0);
 
 	// Mouse wheel & drag scrolling
-	let dragStartY = $state(0);
-	let dragStartX = $state(0);
-	let isDragging = $state(false);
-	let didDrag = $state(false);
-	const DRAG_THRESHOLD = 120;
+	let dragStartY = 0;
+	let dragStartX = 0;
+	let isDragging = false;
+	let didDrag = false;
+	const DRAG_THRESHOLD = 60;
 
 	function selectPrev() {
 		if (selectedIndex > 0) {
@@ -54,9 +54,11 @@
 	}
 
 	function handleWheel(e: WheelEvent) {
-		e.preventDefault();
-		if (e.deltaY > 0 || e.deltaX > 0) selectNext();
-		else if (e.deltaY < 0 || e.deltaX < 0) selectPrev();
+		if (e.deltaY > 0 || e.deltaX > 0) {
+			if (selectedIndex < buttons.length - 1) { e.preventDefault(); selectNext(); }
+		} else if (e.deltaY < 0 || e.deltaX < 0) {
+			if (selectedIndex > 0) { e.preventDefault(); selectPrev(); }
+		}
 	}
 
 	function handleDragStart(e: MouseEvent) {

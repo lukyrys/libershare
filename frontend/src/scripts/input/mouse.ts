@@ -42,11 +42,11 @@ class MouseManager {
 		cursorVisible.set(true);
 	}
 
-	on(action: string, callback: MouseCallback): void {
+	on(action: MouseAction, callback: MouseCallback): void {
 		this.callbacks.set(action, callback);
 	}
 
-	off(action: string): void {
+	off(action: MouseAction): void {
 		this.callbacks.delete(action);
 	}
 
