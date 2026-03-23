@@ -33,6 +33,7 @@
 	let isPressed = $derived(navArea && position ? navArea.isPressed(position) : buttonsGroup ? buttonsGroup.isPressed(index) : pressed);
 
 	function handleClick() {
+		if (disabled) return;
 		if (buttonsGroup && index >= 0) {
 			buttonsGroup.handleClick(index);
 		} else if (onConfirm) {
