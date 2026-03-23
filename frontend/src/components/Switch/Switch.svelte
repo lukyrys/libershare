@@ -4,9 +4,8 @@
 		checked?: boolean;
 		selected?: boolean;
 		disabled?: boolean;
-		onToggle?: (() => void) | undefined;
 	}
-	let { checked = false, selected = false, disabled = false, onToggle }: Props = $props();
+	let { checked = false, selected = false, disabled = false }: Props = $props();
 	let mounted = $state(false);
 
 	onMount(() => {
@@ -83,6 +82,6 @@
 	}
 </style>
 
-<div class="switch" onclick={() => onToggle?.()} onkeydown={e => e.key === 'Enter' && onToggle?.()} role="switch" aria-checked={checked} tabindex="-1">
+<div class="switch" role="switch" aria-checked={checked} tabindex="-1">
 	<span class="slider {mounted ? 'transition' : ''}" class:checked class:selected class:disabled></span>
 </div>
