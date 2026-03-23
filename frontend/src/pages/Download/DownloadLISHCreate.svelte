@@ -374,14 +374,20 @@
 			{#if showAdvanced}
 				{#if saveToFile}
 					<!-- Minify JSON Switch -->
-					<SwitchRow label={$t('settings.lishNetwork.minifyJSON') + ':'} checked={minifyJSON} position={[0, 7]} onConfirm={() => (minifyJSON = !minifyJSON)} />
+					<div role="group" onmouseenter={() => { activateArea(areaID); }}>
+						<SwitchRow label={$t('settings.lishNetwork.minifyJSON') + ':'} checked={minifyJSON} position={[0, 7]} onConfirm={() => (minifyJSON = !minifyJSON)} />
+					</div>
 					<!-- Compress Switch -->
-					<SwitchRow label={$t('settings.lishNetwork.compress') + ':'} checked={compress} position={[0, 8]} onConfirm={handleCompressToggle} />
+					<div role="group" onmouseenter={() => { activateArea(areaID); }}>
+						<SwitchRow label={$t('settings.lishNetwork.compress') + ':'} checked={compress} position={[0, 8]} onConfirm={handleCompressToggle} />
+					</div>
 				{/if}
 				<!-- Chunk Size -->
-				<Input bind:value={chunkSize} label={$t('lish.create.chunkSize')} position={[0, 9]} />
+				<div role="group" onmouseenter={() => { activateArea(areaID); }}>
+					<Input bind:value={chunkSize} label={$t('lish.create.chunkSize')} position={[0, 9]} />
+				</div>
 				<!-- Hash Algorithm -->
-				<div>
+				<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 					<div class="label">{$t('lish.create.algorithm')}:</div>
 					<div class="algo-selector">
 						{#each SUPPORTED_ALGOS as algo, i}
@@ -390,7 +396,9 @@
 					</div>
 				</div>
 				<!-- Threads -->
-				<Input bind:value={threads} label={$t('lish.create.threads')} type="number" min={0} position={[0, 11]} />
+				<div role="group" onmouseenter={() => { activateArea(areaID); }}>
+					<Input bind:value={threads} label={$t('lish.create.threads')} type="number" min={0} position={[0, 11]} />
+				</div>
 			{/if}
 			<Alert type="error" message={errorMessage} />
 		</div>

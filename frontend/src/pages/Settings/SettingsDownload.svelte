@@ -254,7 +254,9 @@
 				<Input bind:value={relayReservations} label={$t('settings.download.maxRelayReservations')} type="number" position={[0, 10]} flex />
 				<Button icon="/img/restart.svg" position={[1, 10]} onConfirm={resetRelayReservations} padding="1vh" fontSize="4vh" borderRadius="1vh" width="6.6vh" height="6.6vh" />
 			</div>
-			<SwitchRow label={$t('settings.download.autoStartSharingDefault') + ':'} checked={autoStart} position={[0, 11]} onToggle={toggleAutoStart} />
+			<div role="group" onmouseenter={() => { activateArea(areaID); }}>
+				<SwitchRow label={$t('settings.download.autoStartSharingDefault') + ':'} checked={autoStart} position={[0, 11]} onToggle={toggleAutoStart} />
+			</div>
 		</div>
 		<ButtonBar justify="center">
 			<Button icon="/img/save.svg" label={$t('common.save')} position={[0, 12]} onConfirm={handleSave} />
