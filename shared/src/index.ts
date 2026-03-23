@@ -1,5 +1,20 @@
 // Product info
-export { productName, productVersion, productIdentifier, productWebsite, productGithub, productNetworkList } from './product.ts';
+export { productName, productVersion, productIdentifier, productWebsite, productGithub, productNetworkList, DEFAULT_API_PORT, DEFAULT_API_URL } from './product.ts';
+
+// Utils
+export { formatBytes, parseBytes, sanitizeFilename } from './utils.ts';
+
+// Compression
+export type CompressionAlgorithm = 'gzip';
+
+/**
+ * Check if a file path has a compressed file extension.
+ * Returns true for known compression extensions (.gz, .gzip, etc.).
+ */
+export function isCompressed(filePath: string): boolean {
+	const lower = filePath.toLowerCase();
+	return lower.endsWith('.gz') || lower.endsWith('.gzip');
+}
 
 // LISH types
 export * from './lish.ts';
@@ -9,6 +24,9 @@ export { API, type IWsClient } from './api.ts';
 
 // WebSocket client
 export { WsClient } from './client.ts';
+
+// Error codes
+export { ErrorCodes, CodedError, type ErrorCode } from './errors.ts';
 
 // Network types
 
@@ -32,7 +50,6 @@ export interface PeerConnectionInfo {
 
 // LISH Network definition (pure network parameters)
 export interface LISHNetworkDefinition {
-	version: number;
 	networkID: string;
 	name: string;
 	description: string;
@@ -92,25 +109,38 @@ export interface SuccessResponse {
 
 export interface CreateLISHResponse {
 	lishID: string;
+	lishFile?: string | undefined;
+}
+
+export interface ImportLISHResponse {
+	lishID: string;
+	directory: string;
 }
 
 export interface DownloadResponse {
 	downloadDir: string;
 }
 
-export interface FetchUrlResponse {
-	url: string;
-	status: number;
-	contentType: string | null;
-	content: string;
-}
-
 // LISH Network file format (.lishnet) — fields may be optional in imported files
 export interface ILISHNetwork {
-	version: number;
 	networkID: string;
 	name: string;
 	description?: string;
 	bootstrapPeers: string[];
 	created?: string;
+}
+
+// System metrics
+export interface SystemRAMInfo {
+	used: number;
+	total: number;
+}
+
+export interface SystemStorageInfo {
+	used: number;
+	total: number;
+}
+
+export interface SystemCPUInfo {
+	usage: number;
 }

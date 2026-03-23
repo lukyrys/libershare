@@ -2,9 +2,7 @@
 import * as readline from 'readline';
 import { join } from 'path';
 import { APIClient } from './api-client';
-import { API } from '@shared';
-
-const DEFAULT_URL = 'ws://localhost:1158';
+import { API, DEFAULT_API_URL } from '@shared';
 
 const HELP = `
 Commands:
@@ -36,17 +34,16 @@ Commands:
   fs.delete <path>                  Delete file or directory
 
   download <lishPath>              Download from .lish file
-  fetch <url>                       Fetch URL content
   help                              Show this help
   quit                              Exit
 `;
 
 const args = process.argv.slice(2);
-let serverUrl = DEFAULT_URL;
+let serverURL = DEFAULT_API_URL;
 
 for (let i = 0; i < args.length; i++) {
 	if ((args[i] === '--url' || args[i] === '-u') && i + 1 < args.length) {
-		serverUrl = args[i + 1]!;
+		serverURL = args[i + 1]!;
 		i++;
 	} else if (args[i] === '--help' || args[i] === '-h') {
 		console.log(`
@@ -55,7 +52,7 @@ CLI - Connect to a running server
 Usage: bun cli.ts [options]
 
 Options:
-  -u, --url <url>   Server WebSocket URL (default: ${DEFAULT_URL})
+  -u, --url <url>   Server WebSocket URL (default: ${DEFAULT_API_URL})
   -h, --help        Show this help message
 ${HELP}`);
 		process.exit(0);
@@ -74,8 +71,8 @@ function resolvePath(x: string): string {
 }
 
 async function main(): Promise<void> {
-	console.log(`Connecting to ${serverUrl}...`);
-	const client = new APIClient(serverUrl);
+	console.log(`Connecting to ${serverURL}...`);
+	const client = new APIClient(serverURL);
 	try {
 		await client.connect();
 	} catch (error: any) {
@@ -103,7 +100,7 @@ async function main(): Promise<void> {
 
 	console.log('Type "help" for commands\n');
 
-	rl.on('line', async line => {
+	rl.on('line', async (line: string) => {
 		const parts = line.trim().split(/\s+/);
 		const command = parts[0];
 		const arg = parts.slice(1).join(' ');
@@ -114,9 +111,8 @@ async function main(): Promise<void> {
 				case 'lishnets.list': {
 					const networks = await api.lishnets.list();
 					console.log('Networks:');
-					if (networks.length === 0) {
-						console.log('  (none)');
-					} else {
+					if (networks.length === 0) console.log('  (none)');
+					else {
 						networks.forEach(n => {
 							const status = n.enabled ? '✓' : '✗';
 							console.log(`  ${status} ${n.name} (${n.networkID})`);
@@ -141,8 +137,8 @@ async function main(): Promise<void> {
 						break;
 					}
 					console.log(`Importing network from: ${arg}`);
-					const network = await api.lishnets.importFromFile(arg, true);
-					console.log(`✓ Network imported: ${network.name} (${network.networkID})`);
+					const networks = await api.lishnets.importFromFile(arg, true);
+					for (const n of networks) console.log(`✓ Network imported: ${n.name} (${n.networkID})`);
 					break;
 				}
 
@@ -209,7 +205,6 @@ async function main(): Promise<void> {
 					for (const info of infos) {
 						const status = info.enabled ? '✓' : '✗';
 						console.log(`${status} ${info.name} (${info.networkID})`);
-						console.log(`    version: ${info.version}`);
 						if (info.description) console.log(`    description: ${info.description}`);
 						console.log(`    bootstrapPeers: ${info.bootstrapPeers.length}`);
 						if (info.enabled && info.peerID) {
@@ -217,9 +212,7 @@ async function main(): Promise<void> {
 							console.log(`    addresses: ${info.addresses?.length || 0}`);
 							info.addresses?.forEach(a => console.log(`      ${a}`));
 							console.log(`    connected: ${info.connected || 0}`);
-							if (info.connectedPeers && info.connectedPeers.length > 0) {
-								info.connectedPeers.forEach(p => console.log(`      ${p}`));
-							}
+							if (info.connectedPeers && info.connectedPeers.length > 0) info.connectedPeers.forEach(p => console.log(`      ${p}`));
 							console.log(`    peersInStore: ${info.peersInStore || 0}`);
 						}
 						console.log('');
@@ -254,11 +247,8 @@ async function main(): Promise<void> {
 					if (!networkID) break;
 					const peers = await api.lishnets.getPeers(networkID);
 					console.log('Peers:');
-					if (peers.length === 0) {
-						console.log('  (none)');
-					} else {
-						peers.forEach(p => console.log(`  ${p}`));
-					}
+					if (peers.length === 0) console.log('  (none)');
+					else peers.forEach(p => console.log(`  ${p}`));
 					break;
 				}
 
@@ -267,23 +257,17 @@ async function main(): Promise<void> {
 					if (!networkID) break;
 					const addresses = await api.lishnets.getAddresses(networkID);
 					console.log('Addresses:');
-					if (addresses.length === 0) {
-						console.log('  (none)');
-					} else {
-						addresses.forEach(a => console.log(`  ${a}`));
-					}
+					if (addresses.length === 0) console.log('  (none)');
+					else addresses.forEach(a => console.log(`  ${a}`));
 					break;
 				}
 
 				// ============ LISHs ============
 				case 'lishs.list': {
-					const lishs = await api.lishs.list();
+					const { items: lishs } = await api.lishs.list();
 					console.log('LISHs:');
-					if (lishs.length === 0) {
-						console.log('  (none)');
-					} else {
-						lishs.forEach(m => console.log(`  ${m.id}`));
-					}
+					if (lishs.length === 0) console.log('  (none)');
+					else lishs.forEach(m => console.log(`  ${m.id}`));
 					break;
 				}
 
@@ -301,9 +285,8 @@ async function main(): Promise<void> {
 				case 'datasets.list': {
 					const datasets = await api.datasets.list();
 					console.log('Datasets:');
-					if (datasets.length === 0) {
-						console.log('  (none)');
-					} else {
+					if (datasets.length === 0) console.log('  (none)');
+					else {
 						datasets.forEach(d => {
 							const status = d.complete ? '✓' : '⋯';
 							console.log(`  ${status} ${d.lishID} (${d.directory})`);
@@ -349,9 +332,8 @@ async function main(): Promise<void> {
 					const result = await api.fs.list(arg || undefined);
 					console.log(`Path: ${result.path}`);
 					console.log('Entries:');
-					if (result.entries.length === 0) {
-						console.log('  (empty)');
-					} else {
+					if (result.entries.length === 0) console.log('  (empty)');
+					else {
 						result.entries.forEach(e => {
 							const icon = e.type === 'directory' ? '📁' : e.type === 'drive' ? '💾' : '📄';
 							const size = e.size !== undefined ? ` (${e.size})` : '';
@@ -405,19 +387,6 @@ async function main(): Promise<void> {
 					break;
 				}
 
-				case 'fetch': {
-					if (!arg) {
-						console.log('Usage: fetch <url>');
-						break;
-					}
-					const result = await api.fetchUrl(arg);
-					console.log(`Status: ${result.status}`);
-					console.log(`Content-Type: ${result.contentType}`);
-					console.log('---');
-					console.log(result.content);
-					break;
-				}
-
 				case 'help':
 				case 'h':
 				case '?':
@@ -426,11 +395,13 @@ async function main(): Promise<void> {
 
 				case 'quit':
 				case 'exit':
-				case 'q':
+				case 'q': {
 					console.log('Bye!');
 					client.close();
 					rl.close();
 					process.exit(0);
+					break;
+				}
 
 				default:
 					console.log(`Unknown command: ${command}. Type "help" for commands.`);

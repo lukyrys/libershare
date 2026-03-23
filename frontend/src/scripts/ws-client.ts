@@ -1,19 +1,18 @@
 import { writable } from 'svelte/store';
-import { WsClient } from '@shared';
+import { WsClient, DEFAULT_API_URL } from '@shared';
+import { addNotification } from './notifications.ts';
+import { tt } from './language.ts';
 
 function getAPIURL(): string {
 	// When running inside Tauri, the backend port is passed via initialization script
-	if (typeof window !== 'undefined' && (window as any).__BACKEND_PORT__) {
-		return `ws://localhost:${(window as any).__BACKEND_PORT__}`;
-	}
-	const defaultAPIURL = 'ws://localhost:1158';
-	return import.meta.env['VITE_BACKEND_URL'] || defaultAPIURL;
+	if (typeof window !== 'undefined' && (window as any).__BACKEND_PORT__) return `ws://localhost:${(window as any).__BACKEND_PORT__}`;
+	return import.meta.env['VITE_BACKEND_URL'] || DEFAULT_API_URL;
 }
 
 export const apiURL = getAPIURL();
-console.log('[API] Backend URL:', apiURL);
 export const connected = writable(false);
 
 export const wsClient = new WsClient(apiURL, (state: { connected: boolean }) => {
 	connected.set(state.connected);
 });
+wsClient.onError = () => addNotification(tt('common.websocketError'));

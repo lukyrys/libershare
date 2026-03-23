@@ -1,9 +1,11 @@
 import * as fsPromises from 'node:fs/promises';
 import { type Stats } from 'node:fs';
-import { type HashAlgorithm, type ILISH, type IDirectoryEntry, type IFileEntry, type ILinkEntry } from '@shared';
+import { dirname, join } from 'node:path';
+import { type HashAlgorithm, type ILISH, type IStoredLISH, type IDirectoryEntry, type IFileEntry, type ILinkEntry, SUPPORTED_ALGOS, CodedError, ErrorCodes } from '@shared';
+import { type CompressionAlgorithm } from '@shared';
 import { calculateChecksum } from './checksum.ts';
-export const LISH_VERSION = 1;
-export const DEFAULT_CHUNK_SIZE: number = 1024 * 1024;
+import { Utils } from '../utils.ts';
+import { type DataServer } from './data-server.ts';
 
 // Helper to normalize paths to forward slashes
 function normalizePath(p: string): string {
@@ -38,16 +40,17 @@ async function getStats(fullPath: string): Promise<Stats> {
 		const stat = await Bun.file(fullPath).stat();
 		return stat;
 	} catch (e) {
-		throw new Error(`Cannot access path: ${fullPath}`);
+		throw new CodedError(ErrorCodes.PATH_ACCESS_DENIED, fullPath);
 	}
 }
 
 // Calculate checksums sequentially (single-threaded, no worker overhead)
-async function calculateChecksumsSequential(filePath: string, fileSize: number, chunkSize: number, algo: HashAlgorithm, _maxWorkers: number, onProgress?: (completed: number, total: number) => void): Promise<string[]> {
+async function calculateChecksumsSequential(filePath: string, fileSize: number, chunkSize: number, algo: HashAlgorithm, _maxWorkers: number, onProgress?: (completed: number, total: number) => void, signal?: AbortSignal): Promise<string[]> {
 	const totalChunks = Math.ceil(fileSize / chunkSize);
 	const file = Bun.file(filePath);
 	const results: string[] = [];
 	for (let i = 0; i < totalChunks; i++) {
+		if (signal?.aborted) throw new CodedError(ErrorCodes.LISH_CREATE_CANCELLED);
 		const checksum = await calculateChecksum(file, i * chunkSize, chunkSize, algo);
 		results.push(checksum);
 		if (onProgress) onProgress(i + 1, totalChunks);
@@ -56,15 +59,14 @@ async function calculateChecksumsSequential(filePath: string, fileSize: number, 
 }
 
 // Calculate checksums in parallel using workers
-async function calculateChecksumsParallel(filePath: string, fileSize: number, chunkSize: number, algo: HashAlgorithm, maxWorkers: number, onProgress?: (completed: number, total: number) => void): Promise<string[]> {
+async function calculateChecksumsParallel(filePath: string, fileSize: number, chunkSize: number, algo: HashAlgorithm, maxWorkers: number, onProgress?: (completed: number, total: number) => void, signal?: AbortSignal): Promise<string[]> {
+	if (signal?.aborted) throw new CodedError(ErrorCodes.LISH_CREATE_CANCELLED);
 	const totalChunks = Math.ceil(fileSize / chunkSize);
 	const cpuCount = maxWorkers > 0 ? maxWorkers : navigator.hardwareConcurrency || 1;
 	const workerCount = Math.min(cpuCount, totalChunks);
 	// Create workers
 	const workers: Worker[] = [];
-	for (let i = 0; i < workerCount; i++) {
-		workers.push(new Worker(new URL('./checksum-worker.ts', import.meta.url).href));
-	}
+	for (let i = 0; i < workerCount; i++) workers.push(new Worker(new URL('./checksum-worker.ts', import.meta.url).href));
 	let completedChunks = 0;
 	const results: string[] = new Array(totalChunks);
 	let nextChunk = 0;
@@ -72,6 +74,17 @@ async function calculateChecksumsParallel(filePath: string, fileSize: number, ch
 	// Process chunks by feeding workers one at a time
 	await new Promise<void>((resolveAll, rejectAll) => {
 		let finished = false;
+		function abortHandler(): void {
+			if (finished) return;
+			finished = true;
+			workers.forEach(w => w.terminate());
+			rejectAll(new CodedError(ErrorCodes.LISH_CREATE_CANCELLED));
+		}
+		if (signal?.aborted) {
+			abortHandler();
+			return;
+		}
+		signal?.addEventListener('abort', abortHandler, { once: true });
 		function feedWorker(workerIndex: number): void {
 			if (finished) return;
 			if (nextChunk >= totalChunks) return;
@@ -81,6 +94,7 @@ async function calculateChecksumsParallel(filePath: string, fileSize: number, ch
 			function handler(event: MessageEvent): void {
 				if (event.data.index === chunkIndex) {
 					worker.removeEventListener('message', handler);
+					if (finished) return;
 					if (event.data.error) {
 						finished = true;
 						rejectAll(new Error(event.data.error));
@@ -90,19 +104,16 @@ async function calculateChecksumsParallel(filePath: string, fileSize: number, ch
 					completedChunks++;
 					if (onProgress) onProgress(completedChunks, totalChunks);
 					if (completedChunks === totalChunks) {
+						signal?.removeEventListener('abort', abortHandler);
 						resolveAll();
-					} else {
-						feedWorker(workerIndex);
-					}
+					} else feedWorker(workerIndex);
 				}
 			}
 			worker.addEventListener('message', handler);
 			worker.postMessage({ filePath, offset, chunkSize, algo, index: chunkIndex });
 		}
 		// Start one chunk per worker
-		for (let i = 0; i < workerCount; i++) {
-			feedWorker(i);
-		}
+		for (let i = 0; i < workerCount; i++) feedWorker(i);
 	});
 	// Terminate workers
 	workers.forEach(w => w.terminate());
@@ -120,9 +131,7 @@ async function scanFiles(dirPath: string, basePath: string, chunkSize: number, i
 	const result: { path: string; size: number; chunks: number }[] = [];
 	const glob = new Bun.Glob('*');
 	const scannedPaths: string[] = [];
-	for await (const entry of glob.scan({ cwd: dirPath, dot: true, onlyFiles: false })) {
-		scannedPaths.push(entry);
-	}
+	for await (const entry of glob.scan({ cwd: dirPath, dot: true, onlyFiles: false })) scannedPaths.push(entry);
 	scannedPaths.sort();
 	for (const entry of scannedPaths) {
 		const fullPath = `${dirPath}/${entry}`;
@@ -138,17 +147,14 @@ async function scanFiles(dirPath: string, basePath: string, chunkSize: number, i
 			const lstat = await fsPromises.lstat(fullPath);
 			isSymlink = lstat.isSymbolicLink();
 		} catch {}
-		if (isSymlink) {
-			continue;
-		} else if (stat.isDirectory()) {
+		if (isSymlink) continue;
+		else if (stat.isDirectory()) {
 			const subFiles = await scanFiles(fullPath, basePath, chunkSize, inodeMap);
 			result.push(...subFiles);
 		} else if (stat.isFile()) {
 			const inodeKey = `${stat.dev}:${stat.ino}`;
 			// Skip hard links (already seen inode)
-			if (stat.ino > 0 && inodeMap[inodeKey]) {
-				continue;
-			}
+			if (stat.ino > 0 && inodeMap[inodeKey]) continue;
 			if (stat.ino > 0) inodeMap[inodeKey] = true;
 			const relativePath = getRelativePath(fullPath, basePath);
 			const totalChunks = Math.ceil(stat.size / chunkSize);
@@ -160,7 +166,7 @@ async function scanFiles(dirPath: string, basePath: string, chunkSize: number, i
 
 type ProgressInfo = { type: 'file-list'; files: { path: string; size: number; chunks: number }[] } | { type: 'file-start'; path: string; size: number; chunks: number } | { type: 'chunk'; path: string; current: number; total: number } | { type: 'file'; path: string };
 
-async function processDirectory(dirPath: string, basePath: string, chunkSize: number, algo: HashAlgorithm, maxWorkers: number, directories: IDirectoryEntry[], files: IFileEntry[], links: ILinkEntry[], inodeMap: InodeMap, onProgress?: (info: ProgressInfo) => void): Promise<void> {
+async function processDirectory(dirPath: string, basePath: string, chunkSize: number, algo: HashAlgorithm, maxWorkers: number, directories: IDirectoryEntry[], files: IFileEntry[], links: ILinkEntry[], inodeMap: InodeMap, onProgress?: (info: ProgressInfo) => void, signal?: AbortSignal): Promise<void> {
 	const stat = await getStats(dirPath);
 	// Add directory entry
 	const relativePath = getRelativePath(dirPath, basePath);
@@ -176,12 +182,11 @@ async function processDirectory(dirPath: string, basePath: string, chunkSize: nu
 	// Read directory contents
 	const glob = new Bun.Glob('*');
 	const scannedPaths: string[] = [];
-	for await (const entry of glob.scan({ cwd: dirPath, dot: true, onlyFiles: false })) {
-		scannedPaths.push(entry);
-	}
+	for await (const entry of glob.scan({ cwd: dirPath, dot: true, onlyFiles: false })) scannedPaths.push(entry);
 	// Sort paths alphabetically
 	scannedPaths.sort();
 	for (const entry of scannedPaths) {
+		if (signal?.aborted) throw new CodedError(ErrorCodes.LISH_CREATE_CANCELLED);
 		const fullPath = `${dirPath}/${entry}`;
 		const stat = await getStats(fullPath);
 		// Check if it's a symlink using lstat (lstat does NOT follow symlinks, stat does)
@@ -208,7 +213,7 @@ async function processDirectory(dirPath: string, basePath: string, chunkSize: nu
 			}
 		} else if (stat.isDirectory()) {
 			// Recursively process subdirectory
-			await processDirectory(fullPath, basePath, chunkSize, algo, maxWorkers, directories, files, links, inodeMap, onProgress);
+			await processDirectory(fullPath, basePath, chunkSize, algo, maxWorkers, directories, files, links, inodeMap, onProgress, signal);
 		} else if (stat.isFile()) {
 			const inodeKey = `${stat.dev}:${stat.ino}`;
 			const relativePath = getRelativePath(fullPath, basePath);
@@ -230,11 +235,23 @@ async function processDirectory(dirPath: string, basePath: string, chunkSize: nu
 				const totalChunks = Math.ceil(stat.size / chunkSize);
 				// Progress feedback - file start
 				if (onProgress) onProgress({ type: 'file-start', path: relativePath, size: stat.size, chunks: totalChunks });
-				// Calculate checksums (sequential for 1 thread, parallel for multiple)
-				const calcFn = maxWorkers === 1 ? calculateChecksumsSequential : calculateChecksumsParallel;
-				const checksums = await calcFn(fullPath, stat.size, chunkSize, algo, maxWorkers, (completed, total) => {
-					if (onProgress) onProgress({ type: 'chunk', path: relativePath, current: completed, total });
-				});
+				// Calculate checksums (skip for empty files)
+				let checksums: string[];
+				if (stat.size === 0) checksums = [];
+				else {
+					const calcFn = maxWorkers === 1 ? calculateChecksumsSequential : calculateChecksumsParallel;
+					checksums = await calcFn(
+						fullPath,
+						stat.size,
+						chunkSize,
+						algo,
+						maxWorkers,
+						(completed, total) => {
+							if (onProgress) onProgress({ type: 'chunk', path: relativePath, current: completed, total });
+						},
+						signal
+					);
+				}
 				files.push({
 					path: relativePath,
 					size: stat.size,
@@ -250,12 +267,11 @@ async function processDirectory(dirPath: string, basePath: string, chunkSize: nu
 	}
 }
 
-export async function createLISH(inputPath: string, name: string | undefined, chunkSize: number, algo: HashAlgorithm, maxWorkers: number = 0, description?: string, onProgress?: (info: ProgressInfo) => void, id?: string): Promise<ILISH> {
+export async function createLISH(inputPath: string, name: string | undefined, chunkSize: number, algo: HashAlgorithm, maxWorkers: number = 0, description?: string, onProgress?: (info: ProgressInfo) => void, id?: string, signal?: AbortSignal): Promise<ILISH> {
 	const created = new Date().toISOString();
-	const lishId = id || globalThis.crypto.randomUUID();
+	const lishID = id || globalThis.crypto.randomUUID();
 	const lish: ILISH = {
-		version: LISH_VERSION,
-		id: lishId,
+		id: lishID,
 		name,
 		description,
 		created,
@@ -275,11 +291,24 @@ export async function createLISH(inputPath: string, name: string | undefined, ch
 		if (onProgress) onProgress({ type: 'file-list', files: [{ path: filename, size: stat.size, chunks: totalChunks }] });
 		// Progress feedback - file start
 		if (onProgress) onProgress({ type: 'file-start', path: filename, size: stat.size, chunks: totalChunks });
-		// Calculate checksums (sequential for 1 thread, parallel for multiple)
-		const calcFn = maxWorkers === 1 ? calculateChecksumsSequential : calculateChecksumsParallel;
-		const checksums = await calcFn(inputPath, stat.size, chunkSize, algo, maxWorkers, (completed, total) => {
-			if (onProgress) onProgress({ type: 'chunk', path: filename, current: completed, total });
-		});
+		// Calculate checksums (skip for empty files)
+		let checksums: string[];
+		if (stat.size === 0) checksums = [];
+		else {
+			if (signal?.aborted) throw new CodedError(ErrorCodes.LISH_CREATE_CANCELLED);
+			const calcFn = maxWorkers === 1 ? calculateChecksumsSequential : calculateChecksumsParallel;
+			checksums = await calcFn(
+				inputPath,
+				stat.size,
+				chunkSize,
+				algo,
+				maxWorkers,
+				(completed, total) => {
+					if (onProgress) onProgress({ type: 'chunk', path: filename, current: completed, total });
+				},
+				signal
+			);
+		}
 		lish.files = [
 			{
 				path: filename,
@@ -302,7 +331,7 @@ export async function createLISH(inputPath: string, name: string | undefined, ch
 		const scannedFiles = await scanFiles(inputPath, inputPath, chunkSize);
 		if (onProgress) onProgress({ type: 'file-list', files: scannedFiles });
 		// Now process directory (computes checksums with per-file progress)
-		await processDirectory(inputPath, inputPath, chunkSize, algo, maxWorkers, directories, files, links, inodeMap, onProgress);
+		await processDirectory(inputPath, inputPath, chunkSize, algo, maxWorkers, directories, files, links, inodeMap, onProgress, signal);
 		// Sort all arrays alphabetically by path
 		directories.sort((a, b) => a.path.localeCompare(b.path));
 		files.sort((a, b) => a.path.localeCompare(b.path));
@@ -311,6 +340,129 @@ export async function createLISH(inputPath: string, name: string | undefined, ch
 		if (directories.length > 0) lish.directories = directories;
 		if (files.length > 0) lish.files = files;
 		if (links.length > 0) lish.links = links;
-	} else throw new Error('Input must be a file or directory');
+	} else throw new CodedError(ErrorCodes.INVALID_INPUT_TYPE);
 	return lish;
+}
+// ============================================================================
+// LISH Export / Import / Validation
+// ============================================================================
+
+export async function exportLISHToFile(lish: IStoredLISH, outputFilePath: string, minifyJSON: boolean = false, compress: boolean = false, compressionAlgorithm: CompressionAlgorithm = 'gzip'): Promise<void> {
+	await fsPromises.mkdir(dirname(outputFilePath), { recursive: true });
+	const { directory, chunks, ...exportData } = lish;
+	await Utils.writeJSONToFile(exportData, outputFilePath, minifyJSON, compress, compressionAlgorithm);
+	console.log(`✓ LISH exported to: ${outputFilePath}`);
+}
+
+/**
+ * Validate that the given data is a valid ILISH object.
+ * Throws a descriptive error if any required field is missing or invalid.
+ */
+export function validateImportedLISH(data: unknown): ILISH {
+	if (!data || typeof data !== 'object') throw new CodedError(ErrorCodes.LISH_INVALID_FORMAT);
+	const obj = data as Record<string, unknown>;
+	if (typeof obj['id'] !== 'string' || !obj['id']) throw new CodedError(ErrorCodes.LISH_MISSING_ID);
+	if (typeof obj['created'] !== 'string' || !obj['created']) throw new CodedError(ErrorCodes.LISH_MISSING_CREATED);
+	if (typeof obj['chunkSize'] !== 'number' || obj['chunkSize'] <= 0) throw new CodedError(ErrorCodes.LISH_INVALID_CHUNK_SIZE);
+	if (typeof obj['checksumAlgo'] !== 'string' || !(SUPPORTED_ALGOS as readonly string[]).includes(obj['checksumAlgo'])) throw new CodedError(ErrorCodes.LISH_UNSUPPORTED_CHECKSUM, String(obj['checksumAlgo']));
+	return data as ILISH;
+}
+
+/**
+ * Read a .lish/.lishs (or compressed) file and return the parsed ILISH(s).
+ * Handles both single objects and arrays.
+ */
+export async function importLISHFromFile(filePath: string): Promise<ILISH[]> {
+	const content = await Utils.readFileCompressed(filePath);
+	const data = Utils.safeJSONParse(content, filePath);
+	if (Array.isArray(data)) return data.map(item => validateImportedLISH(item));
+	return [validateImportedLISH(data)];
+}
+
+/**
+ * Parse a JSON string into validated ILISH object(s).
+ * Handles both single objects and arrays.
+ */
+export function parseLISHFromJSON(json: string): ILISH[] {
+	const data = Utils.safeJSONParse(json, 'JSON input');
+	if (Array.isArray(data)) return data.map(item => validateImportedLISH(item));
+	return [validateImportedLISH(data)];
+}
+
+export interface VerifyFileProgress {
+	lishID: string;
+	filePath: string;
+	verifiedChunks: number;
+	done?: boolean;
+	reset?: boolean;
+}
+
+/**
+ * Verify all chunks of a LISH by comparing stored checksums against actual file data.
+ * Emits progress events per chunk via onProgress callback.
+ */
+/**
+ * Reset verification state in DB. Call before starting verification.
+ */
+export function resetVerification(dataServer: DataServer, lishID: string): void {
+	const meta = dataServer.get(lishID);
+	if (!meta) throw new CodedError(ErrorCodes.LISH_NOT_FOUND, lishID);
+	dataServer.resetVerification(lishID);
+}
+
+/**
+ * Run verification of all chunks (call after resetVerification).
+ * Fire & forget — errors are logged, not thrown.
+ * Pass an AbortSignal to allow cancellation.
+ */
+export async function runVerification(dataServer: DataServer, lishID: string, onProgress: (progress: VerifyFileProgress) => void, signal?: AbortSignal): Promise<void> {
+	const meta = dataServer.get(lishID);
+	if (!meta || !meta.directory) return;
+	const files = dataServer.getFilesForVerification(lishID);
+	if (!files) return;
+	for (const fileEntry of files) {
+		if (signal?.aborted) return;
+		if (!dataServer.get(lishID)) return;
+		const filePath = join(meta.directory, fileEntry.path);
+		let fileVerified = 0;
+		const file = Bun.file(filePath);
+		const fileExists = await file.exists();
+		if (!fileExists) {
+			// console.log(`[Verify] MISSING ${fileEntry.path} — file does not exist on disk (${fileEntry.checksums.length} chunks skipped)`);
+			onProgress({ lishID, filePath: fileEntry.path, verifiedChunks: 0 });
+			continue;
+		}
+		for (let chunkIndex = 0; chunkIndex < fileEntry.checksums.length; chunkIndex++) {
+			if (signal?.aborted) return;
+			const expectedChecksum = fileEntry.checksums[chunkIndex]!;
+			const offset = chunkIndex * meta.chunkSize;
+			// File is smaller than this chunk's offset — data is missing
+			if (offset >= file.size) {
+				if (chunkIndex === 0 || offset === chunkIndex * meta.chunkSize) {
+					// console.log(`[Verify] SHORT ${fileEntry.path} chunk ${chunkIndex}: file size ${file.size} < offset ${offset} — file is smaller than expected`);
+				}
+				onProgress({ lishID, filePath: fileEntry.path, verifiedChunks: fileVerified });
+				continue;
+			}
+			try {
+				const actualChecksum = await calculateChecksum(file, offset, meta.chunkSize, meta.checksumAlgo);
+				if (actualChecksum === expectedChecksum) {
+					dataServer.markChunkVerified(lishID, fileEntry.fileInternalID, chunkIndex);
+					fileVerified++;
+					// console.log(`[Verify] PASS ${fileEntry.path} chunk ${chunkIndex}: db=${expectedChecksum.slice(0, 16)}… disk=${actualChecksum.slice(0, 16)}…`);
+				} else {
+					dataServer.markChunkFailed(lishID, fileEntry.fileInternalID, chunkIndex);
+					// console.log(`[Verify] FAIL ${fileEntry.path} chunk ${chunkIndex}: db=${expectedChecksum.slice(0, 16)}… disk=${actualChecksum.slice(0, 16)}…`);
+				}
+			} catch (err: any) {
+				dataServer.markChunkFailed(lishID, fileEntry.fileInternalID, chunkIndex);
+				// console.log(`[Verify] ERROR ${fileEntry.path} chunk ${chunkIndex}: ${err.message}`);
+			}
+			onProgress({ lishID, filePath: fileEntry.path, verifiedChunks: fileVerified });
+		}
+		// console.log(`[Verify] ${fileEntry.path}: ${fileVerified}/${fileEntry.checksums.length} PASS`);
+	}
+
+	onProgress({ lishID, filePath: '', verifiedChunks: 0, done: true });
+	return;
 }

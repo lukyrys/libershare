@@ -3,8 +3,8 @@ import { KEEP_ALIVE } from '@libp2p/interface';
 import { SqliteDatastore } from './datastore.ts';
 import { generateKeyPair, privateKeyToProtobuf, privateKeyFromProtobuf } from '@libp2p/crypto/keys';
 import { type Libp2p } from 'libp2p';
-import { type PeerId, type PrivateKey, type PeerInfo, type Stream } from '@libp2p/interface';
-import { peerIdFromString } from '@libp2p/peer-id';
+import { type PeerId as PeerID, type PrivateKey, type PeerInfo, type Stream } from '@libp2p/interface';
+import { peerIdFromString as peerIDFromString } from '@libp2p/peer-id';
 import { join } from 'path';
 import { DataServer } from '../lish/data-server.ts';
 import { type Settings } from '../settings.ts';
@@ -13,6 +13,7 @@ import { buildLibp2pConfig } from './network-config.ts';
 import { PINK_TOPIC, PONK_TOPIC, createPinkMessage, createPonkMessage } from './pink-ponk.ts';
 import { type HaveMessage, type WantMessage } from './downloader.ts';
 import { lishTopic } from './constants.ts';
+import { CodedError, ErrorCodes } from '@shared';
 const { multiaddr: Multiaddr } = await import('@multiformats/multiaddr');
 type PubSub = any; // PubSub type - using any since the exact type isn't exported from @libp2p/interface v3
 /** Raw gossipsub message event. */
@@ -38,7 +39,7 @@ export class Network {
 	private pingInterval: NodeJS.Timeout | null = null;
 	private statusInterval: NodeJS.Timeout | null = null;
 	private readonly enablePink: boolean;
-	private bootstrapPeerIds: Set<string> = new Set();
+	private bootstrapPeerIDs: Set<string> = new Set();
 	private bootstrapMultiaddrs: any[] = [];
 
 	// Topic handlers: topic -> Set of handler functions
@@ -149,14 +150,19 @@ export class Network {
 		const privateKey = await this.loadOrCreatePrivateKey(this.datastore);
 
 		// Build libp2p config via extracted helper
-		const { config, port, bootstrapPeerIds, bootstrapMultiaddrs } = buildLibp2pConfig({
+		const {
+			config,
+			port,
+			bootstrapPeerIDs: bootstrapPeerIDs,
+			bootstrapMultiaddrs,
+		} = buildLibp2pConfig({
 			privateKey,
 			datastore: this.datastore,
 			allSettings,
 			bootstrapPeers,
-			myPeerId: privateKey.publicKey.toString(),
+			myPeerID: privateKey.publicKey.toString(),
 		});
-		this.bootstrapPeerIds = bootstrapPeerIds;
+		this.bootstrapPeerIDs = bootstrapPeerIDs;
 		this.bootstrapMultiaddrs = bootstrapMultiaddrs;
 
 		console.log('Creating libp2p node...');
@@ -166,7 +172,7 @@ export class Network {
 			if (err?.name === 'UnsupportedListenAddressesError' || err?.code === 'ERR_NO_VALID_ADDRESSES') {
 				console.error(`✗ Failed to start network: port ${port} is likely already in use or the listen address is invalid.`);
 				console.error(`  Try changing the port in settings or stop the other process using port ${port}.`);
-				throw err;
+				throw new CodedError(ErrorCodes.NETWORK_PORT_IN_USE, String(port));
 			}
 			throw err;
 		}
@@ -179,6 +185,7 @@ export class Network {
 			if (err?.name === 'UnsupportedListenAddressesError' || err?.code === 'ERR_NO_VALID_ADDRESSES') {
 				console.error(`✗ Failed to start network: port ${port} is likely already in use or the listen address is invalid.`);
 				console.error(`  Try changing the port in settings or stop the other process using port ${port}.`);
+				throw new CodedError(ErrorCodes.NETWORK_PORT_IN_USE, String(port));
 			}
 			throw err;
 		}
@@ -246,7 +253,7 @@ export class Network {
 			console.log('   Remote addresses:', remoteAddrs.join(', '));
 			console.log('   Total connected peers:', this.node!.getPeers().length);
 
-			if (this.bootstrapPeerIds.has(peerID)) {
+			if (this.bootstrapPeerIDs.has(peerID)) {
 				const connectionMultiaddrs = connections.map(c => c.remoteAddr);
 				await this.node!.peerStore.merge(evt.detail, {
 					multiaddrs: connectionMultiaddrs,
@@ -345,23 +352,23 @@ export class Network {
 			console.error('Network not started - cannot add bootstrap peers');
 			return;
 		}
-		const myPeerId = this.node.peerId.toString();
+		const myPeerID = this.node.peerId.toString();
 		for (const peer of peers) {
 			// Skip our own address or already-known bootstrap peers
-			if (peer.includes(myPeerId)) continue;
+			if (peer.includes(myPeerID)) continue;
 			try {
 				const ma = Multiaddr(peer);
-				const peerID = ma.getPeerId();
-				if (peerID && this.bootstrapPeerIds.has(peerID)) continue;
+				const peerID = ma.getComponents().find(c => c.code === 421)?.value ?? null;
+				if (peerID && this.bootstrapPeerIDs.has(peerID)) continue;
 				if (peerID) {
-					this.bootstrapPeerIds.add(peerID);
+					this.bootstrapPeerIDs.add(peerID);
 					this.bootstrapMultiaddrs.push(ma);
 				}
 				console.log('Adding bootstrap peer:', peer);
 				try {
 					await this.node.dial(ma);
 					if (peerID) {
-						await this.node.peerStore.merge(peerIdFromString(peerID), {
+						await this.node.peerStore.merge(peerIDFromString(peerID), {
 							multiaddrs: [ma],
 							tags: { [KEEP_ALIVE]: { value: 1 } },
 						});
@@ -442,11 +449,7 @@ export class Network {
 
 			// Dispatch to registered topic handlers
 			const handlers = this.topicHandlers.get(topic);
-			if (handlers) {
-				for (const handler of handlers) {
-					handler(message);
-				}
-			}
+			if (handlers) for (const handler of handlers) handler(message);
 		} catch (error) {
 			console.error('Error in handleMessage:', error);
 		}
@@ -482,7 +485,7 @@ export class Network {
 		console.log('Handling want message for lishID:', data.lishID, 'on network:', networkID);
 		const lish = this.dataServer.get(data.lishID);
 		if (!lish) return;
-		const haveChunks = this.dataServer.getHaveChunks(lish);
+		const haveChunks = this.dataServer.getHaveChunks(data.lishID);
 		if (haveChunks !== 'all' && haveChunks.size === 0) {
 			console.log('No chunks available for lishID:', data.lishID);
 			return;
@@ -527,14 +530,14 @@ export class Network {
 	}
 
 	async connectToPeer(multiaddr: string): Promise<void> {
-		if (!this.node) throw new Error('Network not started');
+		if (!this.node) throw new CodedError(ErrorCodes.NETWORK_NOT_STARTED);
 		const ma = Multiaddr(multiaddr);
 		await this.node.dial(ma);
 		console.log('→ Connected to:', multiaddr);
 	}
 
 	async dialProtocol(multiaddrs: any[], protocol: string): Promise<Stream> {
-		if (!this.node) throw new Error('Network not started');
+		if (!this.node) throw new CodedError(ErrorCodes.NETWORK_NOT_STARTED);
 		const connection = await this.node.dial(multiaddrs);
 		const stream = await connection.newStream(protocol, { runOnLimitedConnection: true });
 		return stream;
@@ -606,16 +609,14 @@ export class Network {
 	}
 
 	async cliFindPeer(peerID: string): Promise<void> {
-		const id = peerIdFromString(peerID);
+		const id = peerIDFromString(peerID);
 		await this.findPeer(id);
 	}
 
-	async findPeer(peerID: PeerId): Promise<void> {
+	async findPeer(peerID: PeerID): Promise<void> {
 		console.log('Finding peer:');
 		console.log('Closest peers:');
-		for await (const peer of this.node!.peerRouting.getClosestPeers(peerID.toMultihash().bytes)) {
-			console.log(peer.id, peer.multiaddrs);
-		}
+		for await (const peer of this.node!.peerRouting.getClosestPeers(peerID.toMultihash().bytes)) console.log(peer.id, peer.multiaddrs);
 		const peer: PeerInfo = await this.node!.peerRouting.findPeer(peerID);
 		console.log('Found it, multiaddrs are:');
 		peer.multiaddrs.forEach(ma => console.log(ma.toString()));

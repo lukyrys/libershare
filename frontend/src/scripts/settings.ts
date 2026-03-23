@@ -38,8 +38,10 @@ export const autoStartSharing = writable(true);
 export const autoStartOnBoot = writable(true);
 export const showInTray = writable(true);
 export const minimizeToTray = writable(true);
-export const defaultMinifyJson = writable(false);
-export const defaultCompressGzip = writable(false);
+export const notificationTimeout = writable(5);
+export const defaultMinifyJSON = writable(false);
+export const defaultCompress = writable(false);
+export const defaultCompressionAlgorithm = writable('gzip');
 
 // Cached defaults from backend (loaded once)
 export let settingsDefaults: any = null;
@@ -61,9 +63,7 @@ export async function loadSettings(): Promise<void> {
 		settingsDefaults = defaults;
 
 		// Language
-		if (settings.language && languages.some(l => l.id === settings.language)) {
-			currentLanguage.set(settings.language);
-		}
+		if (settings.language && languages.some(l => l.id === settings.language)) currentLanguage.set(settings.language);
 
 		// UI
 		cursorSize.set(settings.ui.cursorSize);
@@ -97,17 +97,17 @@ export async function loadSettings(): Promise<void> {
 		autoStartOnBoot.set(settings.system.autoStartOnBoot);
 		showInTray.set(settings.system.showInTray);
 		minimizeToTray.set(settings.system.minimizeToTray);
+		notificationTimeout.set(settings.system.notificationTimeout);
 
 		// Export
-		defaultMinifyJson.set(settings.export.minifyJson);
-		defaultCompressGzip.set(settings.export.compressGzip);
+		defaultMinifyJSON.set(settings.export.minifyJSON);
+		defaultCompress.set(settings.export.compress);
+		defaultCompressionAlgorithm.set(settings.export.compressionAlgorithm);
 
 		// Input
 		inputInitialDelay.set(settings.input.initialDelay);
 		inputRepeatDelay.set(settings.input.repeatDelay);
 		gamepadDeadzone.set(settings.input.gamepadDeadzone);
-
-		console.log('[Settings] Loaded from backend');
 	} catch (error) {
 		console.error('[Settings] Error loading settings:', error);
 	}
@@ -207,21 +207,27 @@ export function setAutoStartOnBoot(enabled: boolean): void {
 export function setShowInTray(enabled: boolean): void {
 	updateSetting(showInTray, 'system.showInTray', enabled);
 	// If disabling tray, also disable minimize to tray
-	if (!enabled) {
-		updateSetting(minimizeToTray, 'system.minimizeToTray', false);
-	}
+	if (!enabled) updateSetting(minimizeToTray, 'system.minimizeToTray', false);
 }
 
 export function setMinimizeToTray(enabled: boolean): void {
 	updateSetting(minimizeToTray, 'system.minimizeToTray', enabled);
 }
 
-export function setDefaultMinifyJson(enabled: boolean): void {
-	updateSetting(defaultMinifyJson, 'export.minifyJson', enabled);
+export function setNotificationTimeout(seconds: number): void {
+	updateSetting(notificationTimeout, 'system.notificationTimeout', Math.max(0, seconds));
 }
 
-export function setDefaultCompressGzip(enabled: boolean): void {
-	updateSetting(defaultCompressGzip, 'export.compressGzip', enabled);
+export function setDefaultMinifyJSON(enabled: boolean): void {
+	updateSetting(defaultMinifyJSON, 'export.minifyJSON', enabled);
+}
+
+export function setDefaultCompress(enabled: boolean): void {
+	updateSetting(defaultCompress, 'export.compress', enabled);
+}
+
+export function setDefaultCompressionAlgorithm(algorithm: string): void {
+	updateSetting(defaultCompressionAlgorithm, 'export.compressionAlgorithm', algorithm);
 }
 
 // Volume helpers

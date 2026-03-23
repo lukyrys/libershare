@@ -11,19 +11,16 @@ interface State {
 
 export class WsClient {
 	private ws: WebSocket | null = null;
-	private requestId = 0;
-	private pendingRequests = new Map<string | number, PendingRequest>();
+	private pendingRequests = new Map<string, PendingRequest>();
 	private eventListeners = new Map<string, Set<EventCallback>>();
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private connected = false;
 	private connectPromise: Promise<void> | null = null;
 	private apiURL: string;
 	private onStateChange: (state: State) => void;
+	onError?: (error: any) => void;
 
-	constructor(
-		apiURL: string,
-		onStateChange: (state: State) => void
-	) {
+	constructor(apiURL: string, onStateChange: (state: State) => void) {
 		this.apiURL = apiURL;
 		this.onStateChange = onStateChange;
 		this.connect();
@@ -34,14 +31,12 @@ export class WsClient {
 		this.connectPromise = new Promise((resolve, reject) => {
 			this.ws = new WebSocket(this.apiURL);
 			this.ws.onopen = () => {
-				console.log('[API] Connected');
 				this.connected = true;
 				this.onStateChange({ connected: true });
 				this.connectPromise = null;
 				resolve();
 			};
 			this.ws.onclose = () => {
-				console.log('[API] Disconnected');
 				this.connected = false;
 				this.onStateChange({ connected: false });
 				this.connectPromise = null;
@@ -49,7 +44,7 @@ export class WsClient {
 				this.scheduleReconnect();
 			};
 			this.ws.onerror = err => {
-				console.log('[API] WebSocket error', err);
+				this.onError?.(err);
 				if (!this.connected) {
 					this.connectPromise = null;
 					reject(new Error('WebSocket connection failed'));
@@ -92,8 +87,12 @@ export class WsClient {
 			const pending = this.pendingRequests.get(msg.id);
 			if (pending) {
 				this.pendingRequests.delete(msg.id);
-				if (msg.error) pending.reject(new Error(msg.error));
-				else pending.resolve(msg.result);
+				if (msg.error) {
+					const err = new Error(msg.error);
+					(err as any).code = msg.error;
+					(err as any).detail = msg.errorDetail;
+					pending.reject(err);
+				} else pending.resolve(msg.result);
 			}
 		}
 	}
@@ -105,7 +104,7 @@ export class WsClient {
 
 	async call<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
 		await this.ensureConnected();
-		const id = ++this.requestId;
+		const id = crypto.randomUUID();
 		const request = { id, method, params };
 		return new Promise<T>((resolve, reject) => {
 			this.pendingRequests.set(id, { resolve, reject });
@@ -123,9 +122,7 @@ export class WsClient {
 
 		return () => {
 			listeners!.delete(callback);
-			if (listeners!.size === 0) {
-				this.eventListeners.delete(event);
-			}
+			if (listeners!.size === 0) this.eventListeners.delete(event);
 		};
 	}
 

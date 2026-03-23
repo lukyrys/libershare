@@ -2,25 +2,15 @@
 export function formatSize(bytes?: number): string {
 	if (bytes === undefined) return '—';
 	if (bytes < 1024) return `${bytes} B`;
-	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+	return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 // Normalize a path by ensuring it ends with a trailing separator
 export function normalizePath(path: string): string {
 	if (!path) return path;
 	return path.endsWith('/') || path.endsWith('\\') ? path : path + '/';
-}
-
-// Sanitize filename - remove invalid characters and normalize spaces
-export function sanitizeFilename(filename: string): string {
-	// Remove characters not allowed in filenames: < > : " / \ | ? *
-	// Then replace multiple spaces with single space
-	return filename
-		.replace(/[<>:"/\\|?*]/g, '')
-		.replace(/\s+/g, ' ')
-		.trim();
 }
 
 // Join path segments
@@ -69,12 +59,12 @@ export function scrollToElement(elements: (HTMLElement | undefined)[], index: nu
 }
 
 // Open an external URL in a new browser tab/window
-export function openExternalUrl(url: string): void {
+export function openExternalURL(url: string): void {
 	window.open(url, '_blank');
 }
 
 // Minify JSON string by removing whitespace
-export function minifyJson(json: string): string {
+export function minifyJSON(json: string): string {
 	try {
 		return JSON.stringify(JSON.parse(json));
 	} catch {

@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { useArea, activeArea } from '../../scripts/areas.ts';
 	import { type Position } from '../../scripts/navigationLayout.ts';
 	import { CONTENT_OFFSETS } from '../../scripts/navigationLayout.ts';
+	import { createNavArea, navItem, type NavPos } from '../../scripts/navArea.svelte.ts';
 	import SearchBar from '../../components/Search/SearchBar.svelte';
 	import Menu from '../../components/Menu/Menu.svelte';
 	interface Props {
@@ -11,34 +11,33 @@
 		title: string;
 		items: Array<{ id: string; label: string; icon?: string; selected?: boolean; iconPosition?: 'left' | 'top'; iconSize?: string }>;
 		orientation?: 'horizontal' | 'vertical';
-		selectedId?: string;
+		selectedID?: string;
 		buttonWidth?: string;
 		onselect?: (id: string) => void;
 		onBack?: () => void;
 	}
-	let { areaID, position, title, items, orientation = 'horizontal', selectedId, buttonWidth, onselect, onBack }: Props = $props();
+	let { areaID, position, title, items, orientation = 'horizontal', selectedID: selectedID, buttonWidth, onselect, onBack }: Props = $props();
 	let searchAreaID = $derived(`${areaID}-search`);
 	let menuAreaID = $derived(`${areaID}-menu`);
 	// Calculate sub-area positions
 	let searchPosition = $derived({ x: position.x + CONTENT_OFFSETS.top.x, y: position.y + CONTENT_OFFSETS.top.y });
 	let menuPosition = $derived({ x: position.x + CONTENT_OFFSETS.main.x, y: position.y + CONTENT_OFFSETS.main.y });
-	let searchSelected = $derived($activeArea === searchAreaID);
 	let searchBar: SearchBar;
 
-	onMount(() => {
-		// Register search area with position - cleanup is automatic
-		const unregisterSearch = useArea(
-			searchAreaID,
-			{
-				up() { return false; },
-				down() { return false; },
-				confirmUp() { searchBar?.toggleFocus(); },
-				back() { onBack?.(); },
-			},
-			searchPosition
-		);
+	const searchNavHandle = createNavArea(() => ({
+		areaID: searchAreaID,
+		position: searchPosition,
+		onBack,
+	}));
 
-		return unregisterSearch;
+	onMount(() => {
+		return searchNavHandle.controller.register(
+			navItem(
+				() => [0, 0] as NavPos,
+				() => undefined,
+				() => searchBar?.toggleFocus()
+			)
+		);
 	});
 </script>
 
@@ -62,8 +61,8 @@
 </style>
 
 <div class="categories">
-	<SearchBar bind:this={searchBar} selected={searchSelected} />
+	<SearchBar bind:this={searchBar} selected={searchNavHandle.controller.isSelected([0, 0])} />
 	<div class="content">
-		<Menu areaID={menuAreaID} position={menuPosition} {title} {items} {orientation} {selectedId} {buttonWidth} {onselect} {onBack} />
+		<Menu areaID={menuAreaID} position={menuPosition} {title} {items} {orientation} {selectedID} {buttonWidth} {onselect} {onBack} />
 	</div>
 </div>

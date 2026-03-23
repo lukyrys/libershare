@@ -1,18 +1,21 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { useArea, activateArea, activeArea } from '../../scripts/areas.ts';
 	import { type Position } from '../../scripts/navigationLayout.ts';
 	import { CONTENT_POSITIONS } from '../../scripts/navigationLayout.ts';
 	import { t } from '../../scripts/language.ts';
 	import { navigateTo } from '../../scripts/navigation.ts';
-	import { selectedDownload, DOWNLOAD_TABLE_COLUMNS, TEST_DOWNLOADS } from '../../scripts/downloads.ts';
-	import { scrollToElement } from '../../scripts/utils.ts';
+	import { downloads, downloadsLoading, DOWNLOAD_TABLE_COLUMNS } from '../../scripts/downloads.ts';
+	import { api } from '../../scripts/api.ts';
+	import Spinner from '../../components/Spinner/Spinner.svelte';
 	import ButtonBar from '../../components/Buttons/ButtonBar.svelte';
 	import Button from '../../components/Buttons/Button.svelte';
 	import Table from '../../components/Table/Table.svelte';
 	import Header from '../../components/Table/TableHeader.svelte';
 	import Cell from '../../components/Table/TableCell.svelte';
 	import DownloadItem from './DownloadItem.svelte';
+	import ConfirmDialog from '../../components/Dialog/ConfirmDialog.svelte';
+	import Input from '../../components/Input/Input.svelte';
+	import { createNavArea } from '../../scripts/navArea.svelte.ts';
+	import { activateArea } from '../../scripts/areas.ts';
 	interface Props {
 		areaID: string;
 		position?: Position | undefined;
@@ -20,107 +23,30 @@
 		onBack?: (() => void) | undefined;
 	}
 	let { areaID, position = CONTENT_POSITIONS.main, onBack }: Props = $props();
-	let active = $derived($activeArea === areaID);
-	const downloads = TEST_DOWNLOADS;
-	let selectedIndex = $state(0);
-	let itemElements: HTMLElement[] = $state([]);
-	// Toolbar state
-	let toolbarAreaID = $derived(`${areaID}-toolbar`);
-	let toolbarActive = $derived($activeArea === toolbarAreaID);
-	let selectedToolbarIndex = $state(0);
-	function scrollToSelected(): void {
-		scrollToElement(itemElements, selectedIndex);
-	}
+	let showVerifyAllDialog = $state(false);
+	let search = $state('');
+	let allDownloadPaused = $state(true);
+	let allUploadPaused = $state(true);
+	let anyVerifying = $derived($downloads.some(d => d.status === 'verifying' || d.status === 'pending-verification'));
+	let filteredDownloads = $derived(
+		search.trim()
+			? $downloads.filter(d => {
+					const q = search.trim().toLowerCase();
+					return d.name.toLowerCase().includes(q) || d.id.toLowerCase().includes(q);
+				})
+			: $downloads
+	);
 
-	function handleDownloadClick(index: number): void {
+	createNavArea(() => ({ areaID, position, onBack, activate: true }));
+
+	function closeVerifyAllDialog(): void {
+		showVerifyAllDialog = false;
 		activateArea(areaID);
-		selectedIndex = index;
-		scrollToSelected();
-		openDetail();
 	}
 
-	function handleToolbarClick(index: number): void {
-		activateArea(toolbarAreaID);
-		selectedToolbarIndex = index;
-		if (index === 0) navigateTo('create-lish');
-		else if (index === 1) navigateTo('import-lish');
-		else if (index === 2) navigateTo('export-all-lish');
+	function openDetail(download: (typeof $downloads)[number]): void {
+		navigateTo('download-detail', download.name || download.id, { lishID: download.id });
 	}
-
-	function openDetail(): void {
-		const download = downloads[selectedIndex]!;
-		selectedDownload.set(download);
-		navigateTo('download-detail', download.name || download.id);
-	}
-
-	const toolbarHandlers = {
-		up() { return false; },
-		down() {
-			activateArea(areaID);
-			return true;
-		},
-		left() {
-			if (selectedToolbarIndex > 0) {
-				selectedToolbarIndex--;
-				return true;
-			}
-			return false;
-		},
-		right() {
-			if (selectedToolbarIndex < 2) {
-				selectedToolbarIndex++;
-				return true;
-			}
-			return false;
-		},
-		confirmDown() {},
-		confirmUp() {
-			if (selectedToolbarIndex === 0) navigateTo('create-lish');
-			else if (selectedToolbarIndex === 1) navigateTo('import-lish');
-			else if (selectedToolbarIndex === 2) navigateTo('export-all-lish');
-		},
-		confirmCancel() {},
-		back() { onBack?.(); },
-	};
-
-	const areaHandlers = {
-		up() {
-			if (selectedIndex > 0) {
-				selectedIndex--;
-				scrollToSelected();
-				return true;
-			}
-			// Move to toolbar
-			activateArea(toolbarAreaID);
-			return true;
-		},
-		down() {
-			if (selectedIndex < downloads.length - 1) {
-				selectedIndex++;
-				scrollToSelected();
-				return true;
-			}
-			return false;
-		},
-		left() { return false; },
-		right() { return false; },
-		confirmDown() {},
-		confirmUp() {
-			openDetail();
-		},
-		confirmCancel() {},
-		back() { onBack?.(); },
-	};
-
-	onMount(() => {
-		const unregisterToolbar = useArea(toolbarAreaID, toolbarHandlers, position);
-		const unregister = useArea(areaID, areaHandlers, position);
-		activateArea(toolbarAreaID);
-		return () => {
-			unregisterToolbar();
-			unregister();
-		};
-	});
 </script>
 
 <style>
@@ -130,10 +56,13 @@
 		gap: 2vh;
 		height: 100%;
 		padding: 2vh;
+		box-sizing: border-box;
+		overflow: hidden;
 	}
 
 	.container {
 		flex: 1;
+		min-height: 0;
 		border: 0.4vh solid var(--secondary-softer-background);
 		border-radius: 2vh;
 		overflow: hidden;
@@ -148,30 +77,55 @@
 
 <div class="download">
 	<ButtonBar>
-		<Button icon="/img/plus.svg" label={$t('downloads.createLISH')} selected={toolbarActive && selectedToolbarIndex === 0} onConfirm={() => handleToolbarClick(0)} />
-		<Button icon="/img/download.svg" label={$t('common.import')} selected={toolbarActive && selectedToolbarIndex === 1} onConfirm={() => handleToolbarClick(1)} />
-		<Button icon="/img/upload.svg" label={$t('common.exportAll')} selected={toolbarActive && selectedToolbarIndex === 2} onConfirm={() => handleToolbarClick(2)} />
+		<Button icon="/img/plus.svg" label={$t('downloads.createLISH')} position={[0, 0]} onConfirm={() => navigateTo('create-lish')} />
+		<Button icon="/img/download.svg" label={$t('common.import')} position={[1, 0]} onConfirm={() => navigateTo('import-lish')} />
+		<Button icon="/img/upload.svg" label={$t('common.exportAll')} position={[2, 0]} onConfirm={() => navigateTo('export-all-lish')} />
+		<Button icon={allDownloadPaused ? '/img/play.svg' : '/img/pause.svg'} label={allDownloadPaused ? $t('downloads.enableDownloadAll') : $t('downloads.disableDownloadAll')} position={[3, 0]} onConfirm={() => (allDownloadPaused = !allDownloadPaused)} />
+		<Button icon={allUploadPaused ? '/img/play.svg' : '/img/pause.svg'} label={allUploadPaused ? $t('downloads.enableUploadAll') : $t('downloads.disableUploadAll')} position={[4, 0]} onConfirm={() => (allUploadPaused = !allUploadPaused)} />
+		<Button icon="/img/check.svg" label={$t('downloads.verifyAll')} position={[5, 0]} onConfirm={() => (showVerifyAllDialog = true)} />
+		{#if anyVerifying}
+			<Button icon="/img/cross.svg" label={$t('downloads.stopVerifyAll')} position={[6, 0]} onConfirm={() => api.lishs.stopVerifyAll()} />
+		{/if}
 	</ButtonBar>
-	<div class="container">
-		<Table columns={DOWNLOAD_TABLE_COLUMNS} noBorder>
-			<Header fontSize="1.4vh">
-				<Cell>{$t('common.name')}</Cell>
-				<Cell align="center" desktopOnly>{$t('downloads.id')}</Cell>
-				<Cell align="center" desktopOnly>{$t('common.size')}</Cell>
-				<Cell align="center" desktopOnly>{$t('common.progress')}</Cell>
-				<Cell align="center" desktopOnly>{$t('common.status')}</Cell>
-				<Cell align="center" desktopOnly>{$t('downloads.downloadingFrom')}</Cell>
-				<Cell align="center" desktopOnly>{$t('downloads.uploadingTo')}</Cell>
-				<Cell align="center" desktopOnly>{$t('downloads.downloadSpeed')}</Cell>
-				<Cell align="center" desktopOnly>{$t('downloads.uploadSpeed')}</Cell>
-			</Header>
-			<div class="items">
-				{#each downloads as download, index (download.id)}
-					<div bind:this={itemElements[index]} onclick={() => handleDownloadClick(index)} onmouseenter={() => { activateArea(areaID); selectedIndex = index; }} onkeydown={e => e.key === 'Enter' && handleDownloadClick(index)} role="row" tabindex="-1">
-						<DownloadItem name={download.name} id={download.id} progress={download.progress} size={download.size} downloadedSize={download.downloadedSize} status={download.status} downloadPeers={download.downloadPeers} uploadPeers={download.uploadPeers} downloadSpeed={download.downloadSpeed} uploadSpeed={download.uploadSpeed} selected={active && selectedIndex === index} isLast={index === downloads.length - 1} odd={index % 2 === 0} />
-					</div>
-				{/each}
-			</div>
-		</Table>
-	</div>
+	<Input bind:value={search} placeholder={$t('common.search') + ' ...'} fontSize="2vh" position={[0, 1]} />
+	{#if $downloadsLoading}
+		<Spinner size="8vh" />
+	{:else}
+		<div class="container">
+			<Table columns={DOWNLOAD_TABLE_COLUMNS} noBorder>
+				<Header fontSize="1.4vh">
+					<Cell>{$t('common.name')}</Cell>
+					<Cell align="center" desktopOnly>{$t('downloads.id')}</Cell>
+					<Cell align="center" desktopOnly>{$t('common.size')}</Cell>
+					<Cell align="center" desktopOnly>{$t('common.progress')}</Cell>
+					<Cell align="center" desktopOnly>{$t('common.status')}</Cell>
+					<Cell align="center" desktopOnly>{$t('downloads.downloadingFrom')}</Cell>
+					<Cell align="center" desktopOnly>{$t('downloads.uploadingTo')}</Cell>
+					<Cell align="center" desktopOnly>{$t('downloads.downloadSpeed')}</Cell>
+					<Cell align="center" desktopOnly>{$t('downloads.uploadSpeed')}</Cell>
+				</Header>
+				<div class="items">
+					{#each filteredDownloads as download, index (download.id)}
+						<DownloadItem name={download.name} id={download.id} progress={download.progress} size={download.size} downloadedSize={download.downloadedSize} status={download.status} downloadPeers={download.downloadPeers} uploadPeers={download.uploadPeers} downloadSpeed={download.downloadSpeed} uploadSpeed={download.uploadSpeed} position={[0, index + 2]} onConfirm={() => openDetail(download)} isLast={index === filteredDownloads.length - 1} />
+					{/each}
+				</div>
+			</Table>
+		</div>
+	{/if}
 </div>
+{#if showVerifyAllDialog}
+	<ConfirmDialog
+		title={$t('downloads.verifyAll')}
+		message={$t('downloads.verifyAllConfirm')}
+		confirmLabel={$t('common.yes')}
+		cancelLabel={$t('common.no')}
+		confirmIcon="/img/check.svg"
+		cancelIcon="/img/cross.svg"
+		{position}
+		onConfirm={() => {
+			closeVerifyAllDialog();
+			api.lishs.verifyAll();
+		}}
+		onBack={closeVerifyAllDialog}
+	/>
+{/if}

@@ -1,6 +1,5 @@
 # LISH data structure format specification
 
-**Version**: 1
 **Created**: 24 October 2025
 **Last update**: 29 October 2025
 
@@ -25,7 +24,6 @@ This specification describes the logical structure, with JSON examples for clari
 
 ```typescript
 interface ILISH {
-	version: number; // Format version (required)
 	id: string; // Unique UUID for this LISH (required)
 	name?: string; // LISH name (optional)
 	description?: string; // Free-form text description such as author, notes, etc. (optional)
@@ -82,7 +80,17 @@ interface ILinkEntry {
 ## Supported hash algorithms
 
 ```typescript
-type HashAlgorithm = 'sha256' | 'sha384' | 'sha512' | 'sha512-256' | 'sha3-256' | 'sha3-384' | 'sha3-512' | 'blake2b256' | 'blake2b512' | 'blake2s256';
+type HashAlgorithm =
+	| "sha256"
+	| "sha384"
+	| "sha512"
+	| "sha512-256"
+	| "sha3-256"
+	| "sha3-384"
+	| "sha3-512"
+	| "blake2b256"
+	| "blake2b512"
+	| "blake2s256";
 ```
 
 ## Unix permissions
@@ -108,7 +116,6 @@ Files are divided into fixed-size chunks specified by `chunkSize` in LISH. Each 
 
 ```json
 {
-	"version": 1,
 	"id": "34aacabb-9c6f-42a2-aaf4-61fc89c45056",
 	"name": "Project Documentation",
 	"description": "User manual and guides - created by John Doe",
@@ -123,7 +130,7 @@ Files are divided into fixed-size chunks specified by `chunkSize` in LISH. Each 
 			"created": "2025-10-15T08:00:00.000Z"
 		},
 		{
-			"path": "empty-folder",
+			"path": "empty-directory",
 			"permissions": "755",
 			"modified": "2025-10-18T12:00:00.000Z",
 			"created": "2025-10-18T12:00:00.000Z"
@@ -144,7 +151,11 @@ Files are divided into fixed-size chunks specified by `chunkSize` in LISH. Each 
 			"permissions": "644",
 			"modified": "2025-10-21T09:45:00.000Z",
 			"created": "2025-10-20T10:30:00.000Z",
-			"checksums": ["f2960b16993b503c...", "38a4a0a7dd7fdc94...", "3a765cf06c5e6ed9..."]
+			"checksums": [
+				"f2960b16993b503c...",
+				"38a4a0a7dd7fdc94...",
+				"3a765cf06c5e6ed9..."
+			]
 		}
 	],
 	"links": [
@@ -186,7 +197,3 @@ Files are divided into fixed-size chunks specified by `chunkSize` in LISH. Each 
 - The `directories`, `files`, and `links` arrays are optional - a LISH with no entries (empty directory structure) is valid
 - The `created`, `modified`, and `permissions` fields are optional - if `permissions` is not provided, file permissions will not be modified during extraction
 - If `permissions` is omitted, implementations should use default permissions for the target platform
-
-## Version history
-
-- **Version 1**: First version - supports files, directories, links, permissions, and timestamps

@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { useArea, activeArea, activateArea } from '../../scripts/areas.ts';
+	import { type NavPos, createNavArea, navItem } from '../../scripts/navArea.svelte.ts';
 	import { type Position } from '../../scripts/navigationLayout.ts';
 	import { type BreadcrumbItem } from '../../scripts/breadcrumb.ts';
+	import { activateArea } from '../../scripts/areas.ts';
 	import Icon from '../Icon/Icon.svelte';
 	interface Props {
 		areaID: string;
@@ -10,59 +10,56 @@
 		position: Position;
 		onSelect?: ((item: BreadcrumbItem, index: number) => void) | undefined;
 		onBack?: (() => void) | undefined;
-		onDown?: (() => string | false) | undefined; // Return area ID to navigate to, or false for default behavior
+		onDown?: (() => string | false) | undefined;
 	}
 	let { areaID, items, position, onSelect, onBack, onDown }: Props = $props();
-	let selectedIndex = $state(0);
-	let active = $derived($activeArea === areaID);
-	let maxIndex = $derived(items.length - 2); // Last item (current) is not selectable
-	const areaHandlers = {
-		left() {
-			if (selectedIndex > 0) {
-				selectedIndex--;
-				return true;
-			}
-			return false;
+
+	const navHandle = createNavArea(() => ({
+		areaID,
+		position,
+		onBack,
+		onDown,
+		onActivate() {
+			const lastIDx = Math.max(0, items.length - 2);
+			navHandle.controller.select([lastIDx, 0]);
 		},
-		right() {
-			if (selectedIndex < maxIndex) {
-				selectedIndex++;
-				return true;
-			}
-			return false;
-		},
-		up() { return false; },
-		down() {
-			if (onDown) {
-				const target = onDown();
-				if (target) {
-					activateArea(target);
-					return true;
-				}
-			}
-			return false;
-		},
-		confirmDown() {},
-		confirmUp() {
-			const item = items[selectedIndex];
-			if (item && selectedIndex < items.length - 1) onSelect?.(item, selectedIndex);
-		},
-		confirmCancel() {},
-		back() { onBack?.(); },
-		onActivate() { selectedIndex = Math.max(0, items.length - 2); },
-	};
+	}));
 
 	function handleItemClick(index: number) {
-		if (index >= items.length - 1) return; // Current item not selectable
+		if (index >= items.length - 1) return;
 		activateArea(areaID);
-		selectedIndex = index;
+		navHandle.controller.select([index, 0]);
 		const item = items[index];
 		if (item) onSelect?.(item, index);
 	}
 
-	onMount(() => {
-		return useArea(areaID, areaHandlers, position);
-	});
+	function registerItem(node: HTMLElement, selectableIndex: number) {
+		let cleanup: (() => void) | undefined;
+		function setup(idx: number) {
+			cleanup?.();
+			cleanup = undefined;
+			if (idx < 0) return;
+			cleanup = navHandle.controller.register(
+				navItem(
+					() => [idx, 0] as NavPos,
+					() => node,
+					() => {
+						const item = items[idx];
+						if (item) onSelect?.(item, idx);
+					}
+				)
+			);
+		}
+		setup(selectableIndex);
+		return {
+			update(newIDx: number) {
+				setup(newIDx);
+			},
+			destroy() {
+				cleanup?.();
+			},
+		};
+	}
 </script>
 
 <style>
@@ -106,8 +103,8 @@
 		{#if index > 0}
 			<Icon img="/img/caret-right.svg" size="2vh" padding="0" colorVariable="--disabled-foreground" />
 		{/if}
-		{@const isSelected = active && selectedIndex === index}
-		<div class="item" class:current={index === items.length - 1} class:selected={isSelected} class:clickable={index < items.length - 1} onclick={() => handleItemClick(index)} role={index < items.length - 1 ? 'button' : undefined} tabindex="-1">
+		{@const isSelected = navHandle.controller.isSelected([index, 0])}
+		<div use:registerItem={index < items.length - 1 ? index : -1} class="item" class:current={index === items.length - 1} class:selected={isSelected} class:clickable={index < items.length - 1} onclick={() => handleItemClick(index)} onmouseenter={() => { if (index < items.length - 1) navHandle.controller.select([index, 0]); }} role={index < items.length - 1 ? 'button' : undefined} tabindex="-1">
 			{#if item.icon}
 				<Icon img={item.icon} size="2vh" padding="0" colorVariable={isSelected ? '--primary-background' : '--disabled-foreground'} />
 			{:else}

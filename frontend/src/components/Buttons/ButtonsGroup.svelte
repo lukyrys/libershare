@@ -98,8 +98,12 @@
 				},
 			};
 		},
-		isSelected(index) { return active && selectedIndex === index; },
-		isPressed(index) { return active && selectedIndex === index && isAPressed; },
+		isSelected(index) {
+			return active && selectedIndex === index;
+		},
+		isPressed(index) {
+			return active && selectedIndex === index && isAPressed;
+		},
 		handleClick(index: number) {
 			if (didDrag) {
 				didDrag = false;
@@ -132,8 +136,12 @@
 		const handlers =
 			orientation === 'horizontal'
 				? {
-						up() { return false; },
-						down() { return false; },
+						up() {
+							return false;
+						},
+						down() {
+							return false;
+						},
 						left() {
 							if (selectedIndex > 0) {
 								selectedIndex--;
@@ -166,8 +174,12 @@
 							}
 							return false;
 						},
-						left() { return false; },
-						right() { return false; },
+						left() {
+							return false;
+						},
+						right() {
+							return false;
+						},
 					};
 		const unregister = useArea(
 			areaID,
@@ -183,7 +195,9 @@
 				confirmCancel() {
 					isAPressed = false;
 				},
-				back() { onBack?.(); },
+				back() {
+					onBack?.();
+				},
 			},
 			position
 		);
