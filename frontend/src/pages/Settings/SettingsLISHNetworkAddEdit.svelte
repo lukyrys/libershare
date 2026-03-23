@@ -92,23 +92,23 @@
 
 <div class="add-edit">
 	<div class="container">
-		<div onmouseenter={() => { activateArea(areaID); }}>
+		<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 			<Input bind:value={name} label={$t('common.name')} position={[0, 0]} />
 		</div>
-		<div onmouseenter={() => { activateArea(areaID); }}>
+		<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 			<Input bind:value={description} label={$t('common.description')} multiline rows={4} position={[0, 1]} />
 		</div>
 		{#if !isEditing}
-			<div onmouseenter={() => { activateArea(areaID); }}>
+			<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 				<SwitchRow label={$t('settings.lishNetwork.autoGenerate') + ':'} checked={autoGenerateID} position={[0, 2]} onToggle={toggleAutoGenerateID} />
 			</div>
 			{#key autoGenerateID}
-				<div onmouseenter={() => { activateArea(areaID); }}>
+				<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 					<Input bind:value={networkID} label={$t('settings.lishNetwork.networkID')} position={autoGenerateID ? undefined : [0, 3]} disabled={autoGenerateID} />
 				</div>
 			{/key}
 		{:else}
-			<div onmouseenter={() => { activateArea(areaID); }}>
+			<div role="group" onmouseenter={() => { activateArea(areaID); }}>
 				<Input bind:value={networkID} label={$t('settings.lishNetwork.networkID')} position={[0, 2]} />
 			</div>
 		{/if}
@@ -116,7 +116,7 @@
 		{#each bootstrapServers as _server, index (index)}
 			{@const isLast = index === bootstrapServers.length - 1}
 			{@const hasRemove = bootstrapServers.length > 1}
-			<div class="bootstrap-row" onmouseenter={() => { activateArea(areaID); }}>
+			<div class="bootstrap-row" role="group" onmouseenter={() => { activateArea(areaID); }}>
 				<Input bind:value={bootstrapServers[index]} placeholder="address:port" position={[0, bootstrapOffset + index]} flex />
 				{#if hasRemove}
 					<Button icon="/img/minus.svg" position={[1, bootstrapOffset + index]} onConfirm={() => removeBootstrapServer(index)} padding="1vh" fontSize="4vh" borderRadius="1vh" width="6.6vh" height="6.6vh" />
