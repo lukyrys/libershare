@@ -947,59 +947,73 @@ export class Downloader {
 		return false;
 	}
 
+	/** Fix: classify raw fs errors so error-recovery layer picks them up.
+	 * Without this, raw Error with .code='ENOSPC' becomes DOWNLOAD_ERROR in
+	 * transfer.ts async catch, which is NOT in RECOVERABLE_CODES → no auto-recovery. */
+	private classifyFsError(err: any): never {
+		if (err?.code === 'ENOSPC') throw new CodedError(ErrorCodes.DISK_FULL, err.message);
+		if (err?.code === 'EACCES' || err?.code === 'EPERM') throw new CodedError(ErrorCodes.DIRECTORY_ACCESS_DENIED, err.message);
+		if (err?.code === 'ENOENT') throw new CodedError(ErrorCodes.IO_NOT_FOUND, err.message);
+		throw err;
+	}
+
 	private async createDirectoryStructure(totalChunksForProgress: number): Promise<void> {
 		const startTime = Date.now();
-		if (this.lish.directories) {
-			for (const dir of this.lish.directories) {
-				await mkdir(this.safePath(dir.path), { recursive: true });
-			}
-		}
-		let createdFiles = 0;
-		let skippedFiles = 0;
-		if (this.lish.files) {
-			const totalBytes = this.lish.files.reduce((sum, f) => sum + f.size, 0);
-			let totalWritten = 0;
-			let nextProgressAt = 100 * 1024 * 1024; // emit every ~100MB
-			const emitAllocProgress = (currentFile: string, fileWritten: number, fileSize: number) => {
-				const pct = totalBytes > 0 ? Math.round((totalWritten / totalBytes) * 100) : 0;
-				const filePct = fileSize > 0 ? Math.round((fileWritten / fileSize) * 100) : 100;
-				this.onProgress?.({ downloadedChunks: 0, totalChunks: totalChunksForProgress, peers: 0, bytesPerSecond: 0, filePath: '__allocating__', fileDownloadedChunks: pct, allocatingFile: currentFile, allocatingFileProgress: filePct });
-			};
-			for (const file of this.lish.files) {
-				if (this.destroyed) return;
-				const filePath = this.safePath(file.path);
-				await mkdir(dirname(filePath), { recursive: true });
-				if (!(await Bun.file(filePath).exists())) {
-					const fd = await open(filePath, 'w');
-					try {
-						const zeroChunk = new Uint8Array(1024 * 1024);
-						let remaining = file.size;
-						let fileWritten = 0;
-						while (remaining > 0) {
-							if (this.destroyed) return;
-							const writeSize = Math.min(remaining, zeroChunk.length);
-							await fd.write(zeroChunk.subarray(0, writeSize));
-							remaining -= writeSize;
-							totalWritten += writeSize;
-							fileWritten += writeSize;
-							if (totalWritten >= nextProgressAt || remaining === 0) {
-								nextProgressAt = totalWritten + 100 * 1024 * 1024;
-								emitAllocProgress(file.path, fileWritten, file.size);
-								await new Promise(r => setTimeout(r, 0));
-							}
-						}
-					} finally {
-						await fd.close();
-					}
-					createdFiles++;
-					trace(`[DL] created file: ${file.path} (${file.size}B)`);
-				} else {
-					totalWritten += file.size;
-					skippedFiles++;
+		try {
+			if (this.lish.directories) {
+				for (const dir of this.lish.directories) {
+					await mkdir(this.safePath(dir.path), { recursive: true });
 				}
 			}
+			let createdFiles = 0;
+			let skippedFiles = 0;
+			if (this.lish.files) {
+				const totalBytes = this.lish.files.reduce((sum, f) => sum + f.size, 0);
+				let totalWritten = 0;
+				let nextProgressAt = 100 * 1024 * 1024; // emit every ~100MB
+				const emitAllocProgress = (currentFile: string, fileWritten: number, fileSize: number) => {
+					const pct = totalBytes > 0 ? Math.round((totalWritten / totalBytes) * 100) : 0;
+					const filePct = fileSize > 0 ? Math.round((fileWritten / fileSize) * 100) : 100;
+					this.onProgress?.({ downloadedChunks: 0, totalChunks: totalChunksForProgress, peers: 0, bytesPerSecond: 0, filePath: '__allocating__', fileDownloadedChunks: pct, allocatingFile: currentFile, allocatingFileProgress: filePct });
+				};
+				for (const file of this.lish.files) {
+					if (this.destroyed) return;
+					const filePath = this.safePath(file.path);
+					await mkdir(dirname(filePath), { recursive: true });
+					if (!(await Bun.file(filePath).exists())) {
+						const fd = await open(filePath, 'w');
+						try {
+							const zeroChunk = new Uint8Array(1024 * 1024);
+							let remaining = file.size;
+							let fileWritten = 0;
+							while (remaining > 0) {
+								if (this.destroyed) return;
+								const writeSize = Math.min(remaining, zeroChunk.length);
+								await fd.write(zeroChunk.subarray(0, writeSize));
+								remaining -= writeSize;
+								totalWritten += writeSize;
+								fileWritten += writeSize;
+								if (totalWritten >= nextProgressAt || remaining === 0) {
+									nextProgressAt = totalWritten + 100 * 1024 * 1024;
+									emitAllocProgress(file.path, fileWritten, file.size);
+									await new Promise(r => setTimeout(r, 0));
+								}
+							}
+						} finally {
+							await fd.close();
+						}
+						createdFiles++;
+						trace(`[DL] created file: ${file.path} (${file.size}B)`);
+					} else {
+						totalWritten += file.size;
+						skippedFiles++;
+					}
+				}
+			}
+			console.log(`[DL] Directory structure created: ${this.lish.files?.length ?? 0} files in ${this.downloadDir} (created=${createdFiles}, skipped=${skippedFiles}, ${Date.now() - startTime}ms)`);
+		} catch (err: any) {
+			this.classifyFsError(err);
 		}
-		console.log(`[DL] Directory structure created: ${this.lish.files?.length ?? 0} files in ${this.downloadDir} (created=${createdFiles}, skipped=${skippedFiles}, ${Date.now() - startTime}ms)`);
 	}
 
 	/** Re-allocate a single file (create dirs + zero-fill). Used when a file is deleted mid-download. */
@@ -1007,22 +1021,26 @@ export class Downloader {
 		const file = this.lish.files?.[fileIndex];
 		if (!file) return;
 		const filePath = this.safePath(file.path);
-		await mkdir(dirname(filePath), { recursive: true });
-		const f = Bun.file(filePath);
-		if (!(await f.exists()) || f.size !== file.size) {
-			const fd = await open(filePath, 'w');
-			try {
-				const zeroChunk = new Uint8Array(Math.min(1024 * 1024, file.size));
-				let remaining = file.size;
-				while (remaining > 0) {
-					const writeSize = Math.min(remaining, zeroChunk.length);
-					await fd.write(zeroChunk.subarray(0, writeSize));
-					remaining -= writeSize;
+		try {
+			await mkdir(dirname(filePath), { recursive: true });
+			const f = Bun.file(filePath);
+			if (!(await f.exists()) || f.size !== file.size) {
+				const fd = await open(filePath, 'w');
+				try {
+					const zeroChunk = new Uint8Array(Math.min(1024 * 1024, file.size));
+					let remaining = file.size;
+					while (remaining > 0) {
+						const writeSize = Math.min(remaining, zeroChunk.length);
+						await fd.write(zeroChunk.subarray(0, writeSize));
+						remaining -= writeSize;
+					}
+				} finally {
+					await fd.close();
 				}
-			} finally {
-				await fd.close();
+				console.log(`[DL] Re-allocated file: ${file.path} (${file.size} bytes)`);
 			}
-			console.log(`[DL] Re-allocated file: ${file.path} (${file.size} bytes)`);
+		} catch (err: any) {
+			this.classifyFsError(err);
 		}
 	}
 
