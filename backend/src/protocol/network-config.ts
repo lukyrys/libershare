@@ -107,10 +107,15 @@ export function buildLibp2pConfig(params: BuildConfigParams): BuildConfigResult 
 				fanoutTTL: 60000,
 				runOnLimitedConnection: true,
 			}),
+			// INT2 memory-leak investigation (2026-04-15): kadDHT put into
+			// minimal-activity mode — clientMode disables server responsibilities
+			// and the 24h self-query interval effectively neutralizes DHT
+			// background work. Root cause hypothesis: per-peer DHT state
+			// accumulation correlates with RSS growth starting at ~60 min uptime.
 			dht: kadDHT({
-				clientMode: false,
-				initialQuerySelfInterval: 3600000,
-				querySelfInterval: 3600000,
+				clientMode: true,
+				initialQuerySelfInterval: 86400000,
+				querySelfInterval: 86400000,
 			}),
 		},
 	};
