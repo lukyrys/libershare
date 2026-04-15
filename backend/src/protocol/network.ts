@@ -697,28 +697,112 @@ export class Network {
 	}
 
 	/**
-	 * Memory trace source: counts of libp2p and internal collections. Used by
-	 * memory-trace.ts to correlate RSS growth with collection growth.
+	 * Memory trace source: counts of libp2p internals and our own collections.
+	 * Async because peerStore.all() returns a Promise. Used by memory-trace.ts
+	 * to correlate RSS/heap growth with specific subsystem growth.
 	 */
-	getMemTraceStats(): Record<string, number> {
+	async getMemTraceStats(): Promise<Record<string, number>> {
 		let topicHandlerTotal = 0;
 		for (const set of this.topicHandlers.values()) topicHandlerTotal += set.size;
+
 		let libp2pPeers = 0;
 		let libp2pConnections = 0;
 		let libp2pStreams = 0;
-		if (this.node) {
+		let libp2pStreamBufBytes = 0;
+		let peerstoreSize = 0;
+		let gsTopics = 0;
+		let gsPeers = 0;
+		let gsMeshTotal = 0;
+		let gsFanoutTotal = 0;
+		let gsMcacheMsgs = 0;
+		let gsMcacheHistory = 0;
+		let gsMcacheBytes = 0;
+		let gsSeenCache = 0;
+		let dhtRoutingTable = 0;
+		let dhtProviders = 0;
+		let datastoreRows = 0;
+		let datastoreBytes = 0;
+		let datastoreDbBytes = 0;
+
+		const node: any = this.node;
+		if (node) {
 			try {
-				const peers = this.node.getPeers();
+				const peers = node.getPeers();
 				libp2pPeers = peers.length;
 				for (const p of peers) {
-					const arr = this.node.getConnections(p);
+					const arr = node.getConnections(p);
 					libp2pConnections += arr.length;
-					for (const c of arr) libp2pStreams += (c as any).streams?.length ?? 0;
+					for (const c of arr) {
+						const streams = c.streams ?? [];
+						libp2pStreams += streams.length;
+						for (const s of streams) {
+							// Try common muxer buffer accessors (yamux/mplex expose different fields).
+							const bufLen = (s as any).sourceController?.queue?.length
+								?? (s as any).sinkBytes
+								?? (s as any).buffered
+								?? 0;
+							if (typeof bufLen === 'number') libp2pStreamBufBytes += bufLen;
+						}
+					}
 				}
-			} catch {
-				// ignore
+			} catch { /* ignore */ }
+
+			try {
+				const all = await node.peerStore.all();
+				peerstoreSize = Array.isArray(all) ? all.length : 0;
+			} catch { /* ignore */ }
+
+			// Gossipsub internals (best-effort property probing — library
+			// internals are not public API, wrap every access defensively).
+			const gs: any = node.services?.pubsub ?? this.pubsub;
+			if (gs) {
+				try {
+					gsTopics = gs.topics?.size ?? gs.subscriptions?.size ?? 0;
+					gsPeers = gs.peers?.size ?? gs.streamsInbound?.size ?? 0;
+					if (gs.mesh && typeof gs.mesh[Symbol.iterator] === 'function') {
+						for (const set of gs.mesh.values()) gsMeshTotal += set?.size ?? 0;
+					}
+					if (gs.fanout && typeof gs.fanout[Symbol.iterator] === 'function') {
+						for (const set of gs.fanout.values()) gsFanoutTotal += set?.size ?? 0;
+					}
+					const mcache = gs.mcache;
+					if (mcache) {
+						gsMcacheMsgs = mcache.msgs?.size ?? 0;
+						gsMcacheHistory = Array.isArray(mcache.history)
+							? mcache.history.reduce((n: number, arr: any) => n + (arr?.length ?? 0), 0)
+							: 0;
+						if (mcache.msgs && typeof mcache.msgs.values === 'function') {
+							for (const msg of mcache.msgs.values()) {
+								const data = (msg?.message?.data ?? msg?.data) as Uint8Array | undefined;
+								if (data && typeof data.byteLength === 'number') gsMcacheBytes += data.byteLength;
+							}
+						}
+					}
+					gsSeenCache = gs.seenCache?.size ?? gs.cache?.size ?? 0;
+				} catch { /* ignore */ }
+			}
+
+			const dht: any = node.services?.dht;
+			if (dht) {
+				try {
+					dhtRoutingTable = dht.routingTable?.size
+						?? dht.lan?.routingTable?.size
+						?? dht.wan?.routingTable?.size
+						?? 0;
+					dhtProviders = dht.providers?.cache?.size ?? 0;
+				} catch { /* ignore */ }
 			}
 		}
+
+		if (this.datastore && typeof (this.datastore as any).getStats === 'function') {
+			try {
+				const s = (this.datastore as any).getStats();
+				datastoreRows = s.rows ?? 0;
+				datastoreBytes = s.bytes ?? 0;
+				datastoreDbBytes = (s.pageCount ?? 0) * (s.pageSize ?? 0);
+			} catch { /* ignore */ }
+		}
+
 		return {
 			dcutrPeers: this.dcutrPeers.size,
 			bootstrapPeerIDs: this.bootstrapPeerIDs.size,
@@ -729,6 +813,21 @@ export class Network {
 			libp2pPeers,
 			libp2pConnections,
 			libp2pStreams,
+			libp2pStreamBufBytes,
+			peerstoreSize,
+			gsTopics,
+			gsPeers,
+			gsMeshTotal,
+			gsFanoutTotal,
+			gsMcacheMsgs,
+			gsMcacheHistory,
+			gsMcacheBytes,
+			gsSeenCache,
+			dhtRoutingTable,
+			dhtProviders,
+			datastoreRows,
+			datastoreBytes,
+			datastoreDbBytes,
 		};
 	}
 
