@@ -65,6 +65,15 @@ export class SqliteDatastore extends _BaseDatastore {
 		this.db.close();
 	}
 
+	/** Memory-trace helper: row count and total value bytes. */
+	getStats(): { rows: number; bytes: number; pageCount: number; pageSize: number } {
+		if (!this.db) return { rows: 0, bytes: 0, pageCount: 0, pageSize: 0 };
+		const rowStats = this.db.prepare('SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(value)), 0) AS bytes FROM datastore').get() as { rows: number; bytes: number };
+		const pageCount = (this.db.prepare('PRAGMA page_count').get() as { page_count: number } | undefined)?.page_count ?? 0;
+		const pageSize = (this.db.prepare('PRAGMA page_size').get() as { page_size: number } | undefined)?.page_size ?? 0;
+		return { rows: rowStats.rows, bytes: rowStats.bytes, pageCount, pageSize };
+	}
+
 	put(key: Key, val: Uint8Array): Key {
 		this.ensureOpen();
 		this.stmtPut.run(key.toString(), Buffer.from(val));
