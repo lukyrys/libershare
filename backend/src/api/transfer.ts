@@ -47,6 +47,40 @@ export function isDownloadEnabled(lishID: string): boolean { return downloadEnab
 export function markDownloadEnabled(lishID: string): void { downloadEnabledLishs.add(lishID); persistDownloadEnabled?.(lishID, true); }
 let _activeDownloaders: Map<string, any> | null = null;
 export function setActiveDownloadersRef(ref: Map<string, any>): void { _activeDownloaders = ref; }
+
+/**
+ * Memory trace source: aggregate Downloader fleet counts. Pulls per-instance
+ * state via Downloader.getMemTraceStats() when available.
+ */
+export function getDownloaderFleetMemTraceStats(): Record<string, number> {
+	const map = _activeDownloaders;
+	const stats: Record<string, number> = {
+		count: map?.size ?? 0,
+		peers: 0,
+		failedPeers: 0,
+		noDataPeers: 0,
+		missingChunks: 0,
+		speedSamples: 0,
+		retryPending: 0,
+		pubsubHandlers: 0,
+		noPeersRetries: 0,
+	};
+	if (!map) return stats;
+	for (const dl of map.values()) {
+		if (typeof dl?.getMemTraceStats === 'function') {
+			try {
+				const s = dl.getMemTraceStats() as Record<string, number>;
+				for (const k of Object.keys(stats)) {
+					if (k === 'count') continue;
+					stats[k] = (stats[k] ?? 0) + (s[k] ?? 0);
+				}
+			} catch {
+				// ignore
+			}
+		}
+	}
+	return stats;
+}
 export async function forceDisableDownload(lishID: string): Promise<void> {
 	downloadEnabledLishs.delete(lishID);
 	persistDownloadEnabled?.(lishID, false);

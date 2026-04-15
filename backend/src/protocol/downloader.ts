@@ -85,6 +85,23 @@ export class Downloader {
 	}
 	getPeerCount(): number { return this.lastServingPeerCount; }
 
+	/**
+	 * Memory trace source: per-downloader collection sizes. Summed across the
+	 * fleet by getDownloaderFleetMemTraceStats() in transfer.ts.
+	 */
+	getMemTraceStats(): Record<string, number> {
+		return {
+			peers: this.peers.size,
+			failedPeers: this.failedPeers.size,
+			noDataPeers: this.noDataPeers.size,
+			missingChunks: this.missingChunks.length,
+			speedSamples: this.speedSamples.length,
+			retryPending: this.retryTimer ? 1 : 0,
+			pubsubHandlers: this.pubsubHandlers.length,
+			noPeersRetries: this.noPeersRetryCount,
+		};
+	}
+
 	setProgressCallback(cb: (info: { downloadedChunks: number; totalChunks: number; peers: number; bytesPerSecond: number; filePath?: string; fileDownloadedChunks?: number; allocatingFile?: string; allocatingFileProgress?: number }) => void): void {
 		this.onProgress = cb;
 	}

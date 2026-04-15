@@ -268,6 +268,31 @@ export function stopPeerEmitter(): void {
 	if (emitInterval) { clearInterval(emitInterval); emitInterval = null; }
 }
 
+/**
+ * Memory trace source: sizes of internal tracking collections. Used to detect
+ * peer-tracker leaks (entries Map and cumulativeBytes were prior offenders).
+ */
+export function getTrackerMemTraceStats(): Record<string, number> {
+	let totalSamples = 0;
+	let maxSamples = 0;
+	for (const entry of entries.values()) {
+		const n = entry.speedSamples.length;
+		totalSamples += n;
+		if (n > maxSamples) maxSamples = n;
+	}
+	let totalSubs = 0;
+	for (const set of subscriptions.values()) totalSubs += set.size;
+	return {
+		entries: entries.size,
+		cumulativeBytes: cumulativeBytes.size,
+		subscriptions: subscriptions.size,
+		subscriptionEntries: totalSubs,
+		speedSamplesTotal: totalSamples,
+		speedSamplesMax: maxSamples,
+		emitterActive: emitInterval ? 1 : 0,
+	};
+}
+
 // --- Internal: emit aggregated peer details ---
 
 function emitPeerDetails(): void {

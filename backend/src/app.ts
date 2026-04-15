@@ -72,12 +72,25 @@ networks.init();
 import { Downloader } from './protocol/downloader.ts';
 import { setMaxUploadSpeed, setUploadBroadcast, initUploadState } from './protocol/lish-protocol.ts';
 import { getUploadEnabledLishs, setUploadEnabled, getDownloadEnabledLishs, setDownloadEnabled } from './db/lishs.ts';
-import { initDownloadState } from './api/transfer.ts';
+import { initDownloadState, getDownloaderFleetMemTraceStats } from './api/transfer.ts';
+import { getTrackerMemTraceStats } from './protocol/peer-tracker.ts';
+import { startMemoryTrace, registerMemTraceSource } from './monitoring/memory-trace.ts';
 const networkSettings = settings.get().network;
 Downloader.setMaxDownloadSpeed(networkSettings.maxDownloadSpeed);
 setMaxUploadSpeed(networkSettings.maxUploadSpeed);
 initUploadState(getUploadEnabledLishs(db), (lishID, enabled) => setUploadEnabled(db, lishID, enabled));
 initDownloadState(getDownloadEnabledLishs(db), (lishID, enabled) => setDownloadEnabled(db, lishID, enabled));
+
+// Memory trace: structured JSONL of RSS, heap, and internal collection sizes.
+// Enabled by default; override with LIBERSHARE_MEMTRACE=0 or LIBERSHARE_MEMTRACE_INTERVAL_MS.
+if (process.env['LIBERSHARE_MEMTRACE'] !== '0') {
+	registerMemTraceSource('net', () => networks.getNetwork().getMemTraceStats());
+	registerMemTraceSource('tracker', () => getTrackerMemTraceStats());
+	registerMemTraceSource('dl', () => getDownloaderFleetMemTraceStats());
+	const intervalMs = Number(process.env['LIBERSHARE_MEMTRACE_INTERVAL_MS'] ?? 30_000);
+	const tracePath = process.env['LIBERSHARE_MEMTRACE_FILE'] ?? join(dataDir, 'memory-trace.jsonl');
+	startMemoryTrace({ filePath: tracePath, intervalMs, stdout: true });
+}
 
 const apiServer = new APIServer(dataDir, dataServer, networks, settings, {
 	host: apiHost,
