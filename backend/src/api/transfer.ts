@@ -132,10 +132,24 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 		attemptRecover: async (lishID, downloadWasEnabled, uploadWasEnabled) => {
 			let ok = true;
 			if (downloadWasEnabled) {
-				const result = await enableDownload({ lishID });
+				// Fix: pass isRecovery so enableDownload keeps persisted error state
+				// visible in UI until downloader actually reaches a healthy state.
+				const result = await enableDownload({ lishID }, undefined, { isRecovery: true });
 				if (!result.success) ok = false;
 			}
 			if (uploadWasEnabled && ok) enableUploadHandler({ lishID });
+			// Fix: verify the recovery actually stuck — poll dataServer error state
+			// for up to 4s after enableDownload returned. If a new error appears
+			// quickly (e.g. ENOSPC still there), treat the attempt as failed so
+			// cumulativeRetries in error-recovery grows and exp backoff works.
+			if (ok) {
+				const deadline = Date.now() + 4000;
+				while (Date.now() < deadline) {
+					await new Promise(r => setTimeout(r, 250));
+					const lish = dataServer.get(lishID);
+					if (lish && (lish as any).errorCode) { ok = false; break; }
+				}
+			}
 			return ok;
 		},
 		broadcast: (event, data) => { broadcast?.(event, data); },
@@ -201,11 +215,14 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 
 	const pendingDownloads = new Set<string>();
 
-	async function enableDownload(p: { lishID: string }, client?: any): Promise<{ success: boolean }> {
+	async function enableDownload(p: { lishID: string }, client?: any, opts?: { isRecovery?: boolean }): Promise<{ success: boolean }> {
 		assert(p, ['lishID']);
 		if (isBusy(p.lishID)) return { success: false };
 		if (pendingDownloads.has(p.lishID)) return { success: true };
-		dataServer.clearError(p.lishID);
+		// Fix: recovery path keeps the persisted error until downloader actually
+		// reaches a healthy state (see progress callback below). Otherwise UI
+		// flickered to "Idle" for 10-60s between recovery cycles.
+		if (!opts?.isRecovery) dataServer.clearError(p.lishID);
 		downloadEnabledLishs.add(p.lishID);
 		persistDownloadEnabled?.(p.lishID, true);
 		const dl = activeDownloaders.get(p.lishID);
@@ -300,7 +317,16 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 			await downloader.initFromManifest(lish);
 			activeDownloaders.set(p.lishID, downloader);
 			const send = broadcast ?? ((event: string, data: any) => emit(client, event, data));
+			// Fix: during recovery the error stays persisted until the downloader
+			// actually starts making progress (peers>0 && bytes>0). This avoids UI
+			// flicker to "Idle" in the window between enableDownload() and the next
+			// ENOSPC throw.
+			let progressErrorCleared = false;
 			downloader.setProgressCallback?.((info: { downloadedChunks: number; totalChunks: number; peers: number; bytesPerSecond: number }) => {
+				if (!progressErrorCleared && info.peers > 0 && info.bytesPerSecond > 0) {
+					progressErrorCleared = true;
+					dataServer.clearError(p.lishID);
+				}
 				send('transfer.download:progress', { lishID: p.lishID, ...info });
 			});
 			downloader.setRetryCallback?.((info) => {
@@ -314,6 +340,9 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 					if (err instanceof CodedError && err.code === ErrorCodes.DOWNLOAD_CANCELLED) return;
 					const code = err instanceof CodedError ? err.code : ErrorCodes.DOWNLOAD_ERROR;
 					const detail = err instanceof CodedError ? err.detail : err.message;
+					// Fix: log async download errors so they're visible in backend log
+					// (previously silent — only reached frontend via transfer.download:error)
+					console.error(`[Transfer] ${p.lishID.slice(0, 8)}: download failed (${code}): ${detail}`);
 					dataServer.setError(p.lishID, code, detail);
 					downloadEnabledLishs.delete(p.lishID);
 					persistDownloadEnabled?.(p.lishID, false);
