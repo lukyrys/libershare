@@ -296,6 +296,8 @@ export class Network {
 		this.node!.addEventListener('peer:disconnect', evt => {
 			const peerID = evt.detail.toString();
 			console.debug(`❌ Peer disconnected: ${peerID.slice(0, 16)}, remaining: ${this.node!.getPeers().length}`);
+			// Fix C: clear per-peer state on disconnect to prevent unbounded growth
+			this.dcutrPeers.delete(peerID);
 			this.schedulePeerCountCheck();
 		});
 
@@ -695,6 +697,42 @@ export class Network {
 	}
 
 	/**
+	 * Memory trace source: counts of libp2p and internal collections. Used by
+	 * memory-trace.ts to correlate RSS growth with collection growth.
+	 */
+	getMemTraceStats(): Record<string, number> {
+		let topicHandlerTotal = 0;
+		for (const set of this.topicHandlers.values()) topicHandlerTotal += set.size;
+		let libp2pPeers = 0;
+		let libp2pConnections = 0;
+		let libp2pStreams = 0;
+		if (this.node) {
+			try {
+				const peers = this.node.getPeers();
+				libp2pPeers = peers.length;
+				for (const p of peers) {
+					const arr = this.node.getConnections(p);
+					libp2pConnections += arr.length;
+					for (const c of arr) libp2pStreams += (c as any).streams?.length ?? 0;
+				}
+			} catch {
+				// ignore
+			}
+		}
+		return {
+			dcutrPeers: this.dcutrPeers.size,
+			bootstrapPeerIDs: this.bootstrapPeerIDs.size,
+			bootstrapMultiaddrs: this.bootstrapMultiaddrs.length,
+			topicHandlers: this.topicHandlers.size,
+			topicHandlerEntries: topicHandlerTotal,
+			lastPeerCounts: this._lastPeerCounts.size,
+			libp2pPeers,
+			libp2pConnections,
+			libp2pStreams,
+		};
+	}
+
+	/**
 	 * Get topic peers with connection type info (direct vs relay).
 	 */
 	getTopicPeersInfo(networkID: string): { peerID: string; direct: number; relay: number }[] {
@@ -727,6 +765,11 @@ export class Network {
 			this.statusInterval = null;
 		}
 		this.topicHandlers.clear();
+		// Fix C: clear accumulated per-peer/bootstrap state on stop
+		this.dcutrPeers.clear();
+		this.bootstrapPeerIDs.clear();
+		this.bootstrapMultiaddrs = [];
+		this._lastPeerCounts.clear();
 		if (this.node) {
 			await this.node.stop();
 			console.log('Network stopped');
