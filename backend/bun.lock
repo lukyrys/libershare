@@ -36,6 +36,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "@libp2p/kad-dht@16.1.6": "patches/@libp2p%2Fkad-dht@16.1.6.patch",
+  },
   "overrides": {
     "@multiformats/multiaddr": "^12.1.14",
   },

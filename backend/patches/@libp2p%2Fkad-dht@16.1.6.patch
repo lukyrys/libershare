@@ -1,0 +1,148 @@
+diff --git a/dist/src/network.js b/dist/src/network.js
+index 9864f98e028bc8b40b757dd73c16aa41f7b5eddb..50a433b13d0f2f3841387d511b8080a012aaea70 100644
+--- a/dist/src/network.js
++++ b/dist/src/network.js
+@@ -204,15 +204,41 @@ export class Network extends TypedEventEmitter {
+      */
+     async _writeMessage(stream, msg, options) {
+         const pb = pbStream(stream);
+-        await pb.write(msg, Message, options);
++        try {
++            await pb.write(msg, Message, options);
++        }
++        finally {
++            // Fix: unwrap pbStream to detach its stream event listeners
++            // (message, close, remoteCloseWrite). Without this, every outgoing
++            // DHT message leaks a listener set + readBuffer on the stream.
++            try {
++                pb.unwrap();
++            }
++            catch (err) {
++                this.log.error('error unwrapping pbStream (writeMessage) - %e', err);
++            }
++        }
+     }
+     /**
+      * Write a message and read a response
+      */
+     async _writeReadMessage(stream, msg, options) {
+         const pb = pbStream(stream);
+-        await pb.write(msg, Message, options);
+-        const message = await pb.read(Message, options);
++        let message;
++        try {
++            await pb.write(msg, Message, options);
++            message = await pb.read(Message, options);
++        }
++        finally {
++            // Fix: unwrap pbStream to detach its stream event listeners.
++            // See _writeMessage for rationale.
++            try {
++                pb.unwrap();
++            }
++            catch (err) {
++                this.log.error('error unwrapping pbStream (writeReadMessage) - %e', err);
++            }
++        }
+         // tell any listeners about new peers we've seen
+         message.closer.forEach(peerData => {
+             this.safeDispatchEvent('peer', {
+diff --git a/dist/src/rpc/index.js b/dist/src/rpc/index.js
+index de8a062a57f4a0b3a10dbc58e1e1e11b959b9524..1a8e8f588c13a1f318232c979d640da1954c6e31 100644
+--- a/dist/src/rpc/index.js
++++ b/dist/src/rpc/index.js
+@@ -61,46 +61,61 @@ export class RPC {
+         let signal = AbortSignal.timeout(this.incomingMessageTimeout);
+         signal.addEventListener('abort', abortListener);
+         const messages = pbStream(stream).pb(Message);
+-        while (true) {
+-            // the remote will not send any more data
+-            if (stream.readStatus !== 'readable') {
+-                await stream.close({
++        try {
++            while (true) {
++                // the remote will not send any more data
++                if (stream.readStatus !== 'readable') {
++                    await stream.close({
++                        signal
++                    });
++                    break;
++                }
++                const message = await messages.read({
+                     signal
+                 });
+-                break;
++                const stopSuccessTimer = this.metrics?.rpcTime?.timer(message.type.toString());
++                const stopErrorTimer = this.metrics?.rpcTime?.timer(message.type.toString());
++                let errored = false;
++                try {
++                    // handle the message
++                    this.log('incoming %s from %p', message.type, connection.remotePeer);
++                    const res = await this.handleMessage(connection.remotePeer, message);
++                    // Not all handlers will return a response
++                    if (res != null) {
++                        await messages.write(res, {
++                            signal
++                        });
++                    }
++                }
++                catch (err) {
++                    errored = true;
++                    stopErrorTimer?.();
++                    throw err;
++                }
++                finally {
++                    if (!errored) {
++                        stopSuccessTimer?.();
++                    }
++                }
++                // we have received a message so reset the timeout controller to
++                // allow the remote to send another
++                signal.removeEventListener('abort', abortListener);
++                signal = AbortSignal.timeout(this.incomingMessageTimeout);
++                signal.addEventListener('abort', abortListener);
+             }
+-            const message = await messages.read({
+-                signal
+-            });
+-            const stopSuccessTimer = this.metrics?.rpcTime?.timer(message.type.toString());
+-            const stopErrorTimer = this.metrics?.rpcTime?.timer(message.type.toString());
+-            let errored = false;
++        }
++        finally {
++            // Fix: unwrap pbStream to remove its event listeners (message, close,
++            // remoteCloseWrite) from the underlying stream. Without this, each
++            // incoming stream leaks its readBuffer + listener set, causing RSS
++            // growth in DHT server mode.
++            signal.removeEventListener('abort', abortListener);
+             try {
+-                // handle the message
+-                this.log('incoming %s from %p', message.type, connection.remotePeer);
+-                const res = await this.handleMessage(connection.remotePeer, message);
+-                // Not all handlers will return a response
+-                if (res != null) {
+-                    await messages.write(res, {
+-                        signal
+-                    });
+-                }
++                messages.unwrap().unwrap();
+             }
+             catch (err) {
+-                errored = true;
+-                stopErrorTimer?.();
+-                throw err;
+-            }
+-            finally {
+-                if (!errored) {
+-                    stopSuccessTimer?.();
+-                }
++                this.log.error('error unwrapping pbStream - %e', err);
+             }
+-            // we have received a message so reset the timeout controller to
+-            // allow the remote to send another
+-            signal.removeEventListener('abort', abortListener);
+-            signal = AbortSignal.timeout(this.incomingMessageTimeout);
+-            signal.addEventListener('abort', abortListener);
+         }
+     }
+ }
