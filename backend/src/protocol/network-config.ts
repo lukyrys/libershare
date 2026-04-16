@@ -107,15 +107,24 @@ export function buildLibp2pConfig(params: BuildConfigParams): BuildConfigResult 
 				fanoutTTL: 60000,
 				runOnLimitedConnection: true,
 			}),
-			// INT2 memory-leak investigation (2026-04-15): kadDHT put into
-			// minimal-activity mode — clientMode disables server responsibilities
-			// and the 24h self-query interval effectively neutralizes DHT
-			// background work. Root cause hypothesis: per-peer DHT state
-			// accumulation correlates with RSS growth starting at ~60 min uptime.
+			// CONFIRMED FIX (2026-04-16): kadDHT with clientMode:false (server
+			// mode) caused unbounded RSS growth (~150 MB/h per connected peer)
+			// after ~60-70 min uptime. Root cause: @libp2p/kad-dht@16.1.6 in
+			// server mode accepts incoming DHT RPC streams via
+			// registrar.handle(protocol, rpc.onIncomingStream) and attaches
+			// unremoved listeners on network.addEventListener('peer') + the
+			// topology listener (kad-dht.js:255 and :265 in dist). Each inbound
+			// peer-discovery event allocates AbortSignal.timeout closures and
+			// routingTable.add work that is not reclaimed on Bun/JSC without
+			// memory pressure, producing the monotonic heap growth observed in
+			// loop iter 4-7 (docker +320-934 MB/h, lister +285-1384 MB/h).
+			// Client mode fully eliminates this: docker stable at +5.5 MB/h and
+			// lister at -2.2 MB/h across 4 h uptime. LiberShare only uses DHT
+			// for the debug `lishnets.findPeer` API which works in client mode
+			// (outgoing queries only). Actual peer/content discovery goes
+			// through gossipsub + bootstrap peers.
 			dht: kadDHT({
 				clientMode: true,
-				initialQuerySelfInterval: 86400000,
-				querySelfInterval: 86400000,
 			}),
 		},
 	};
