@@ -102,7 +102,10 @@ export function startMemoryTrace(opts: { filePath?: string; intervalMs?: number;
 	// Kick an immediate baseline sample.
 	void writeSample();
 	timer = setInterval(() => void writeSample(), interval);
-	if (typeof (timer as any).unref === 'function') (timer as any).unref();
+	// Intentionally do NOT unref() the timer. In Bun runtime, unref() on
+	// setInterval prevents the callback from firing reliably after the first
+	// tick, producing a memory-trace.jsonl with only the initial uptime=0
+	// entry. Keeping the ref is fine — the timer is cleared on stopMemoryTrace().
 	console.log(`[MEM-TRACE] started (interval=${interval}ms, file=${logPath ?? 'none'}, stdout=${logToStdout}, forceGc=${forceGcEnabled})`);
 }
 
