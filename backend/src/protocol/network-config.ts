@@ -87,8 +87,11 @@ export function buildLibp2pConfig(params: BuildConfigParams): BuildConfigResult 
 		},
 		// No connectionProtector - swarm key removed. Open network, isolation via topics.
 		peerStore: {
-			persistence: true,
-			threshold: 15,
+			// Fix: aggressive address cleanup to prevent Multiaddr instance leak
+			// from DHT peer discovery events (~2300 Multiaddr/min during reprovide).
+			// Default is 1h/6h which lets 138k+ instances accumulate per hour.
+			maxAddressAge: 10 * 60 * 1000, // 10 min (was default 1h)
+			maxPeerAge: 30 * 60 * 1000,    // 30 min (was default 6h)
 		},
 		services: {
 			identify: identify(),
