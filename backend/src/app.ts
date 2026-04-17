@@ -75,6 +75,7 @@ import { getUploadEnabledLishs, setUploadEnabled, getDownloadEnabledLishs, setDo
 import { initDownloadState, getDownloaderFleetMemTraceStats } from './api/transfer.ts';
 import { getTrackerMemTraceStats } from './protocol/peer-tracker.ts';
 import { startMemoryTrace, registerMemTraceSource } from './monitoring/memory-trace.ts';
+import { startHeapSnapshotTrigger } from './monitoring/heap-snapshot.ts';
 const networkSettings = settings.get().network;
 Downloader.setMaxDownloadSpeed(networkSettings.maxDownloadSpeed);
 setMaxUploadSpeed(networkSettings.maxUploadSpeed);
@@ -90,6 +91,12 @@ if (process.env['LIBERSHARE_MEMTRACE'] !== '0') {
 	const intervalMs = Number(process.env['LIBERSHARE_MEMTRACE_INTERVAL_MS'] ?? 30_000);
 	const tracePath = process.env['LIBERSHARE_MEMTRACE_FILE'] ?? join(dataDir, 'memory-trace.jsonl');
 	startMemoryTrace({ filePath: tracePath, intervalMs, stdout: true });
+}
+
+// Heap snapshot trigger: `touch <dataDir>/trigger-heap` or `kill -USR2 <pid>`
+// writes a .heapsnapshot file to dataDir. Open in Chrome DevTools to diff.
+if (process.env['LIBERSHARE_HEAP_TRIGGER'] !== '0') {
+	startHeapSnapshotTrigger(dataDir);
 }
 
 const apiServer = new APIServer(dataDir, dataServer, networks, settings, {
