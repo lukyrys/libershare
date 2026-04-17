@@ -42,6 +42,8 @@
 		"postinstall": "cd node_modules/@chainsafe/libp2p-gossipsub && bun install && bun run build"
 	},
 	"patchedDependencies": {
-		"@libp2p/kad-dht@16.1.6": "patches/@libp2p%2Fkad-dht@16.1.6.patch"
+		"@libp2p/kad-dht@16.1.6": "patches/@libp2p%2Fkad-dht@16.1.6.patch",
+		"@libp2p/identify@4.0.13": "patches/@libp2p%2Fidentify@4.0.13.patch",
+		"@libp2p/dcutr@3.0.14": "patches/@libp2p%2Fdcutr@3.0.14.patch"
 	}
 }

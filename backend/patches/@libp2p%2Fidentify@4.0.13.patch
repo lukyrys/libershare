@@ -1,0 +1,50 @@
+diff --git a/dist/src/identify-push.js b/dist/src/identify-push.js
+index 8f057f74951edda77ac0f31f1db7b79a4017ad5f..14d0447a32d61c59ca3dc13d05008f6a7820bef1 100644
+--- a/dist/src/identify-push.js
++++ b/dist/src/identify-push.js
+@@ -66,6 +66,7 @@ export class IdentifyPush extends AbstractIdentify {
+                     }
+                     yield async () => {
+                         let stream;
++                        let pb;
+                         const signal = AbortSignal.timeout(self.timeout);
+                         setMaxListeners(Infinity, signal);
+                         try {
+@@ -73,7 +74,7 @@ export class IdentifyPush extends AbstractIdentify {
+                                 signal,
+                                 runOnLimitedConnection: self.runOnLimitedConnection
+                             });
+-                            const pb = pbStream(stream, {
++                            pb = pbStream(stream, {
+                                 maxDataLength: self.maxMessageSize
+                             }).pb(IdentifyMessage);
+                             await pb.write({
+@@ -95,6 +96,10 @@ export class IdentifyPush extends AbstractIdentify {
+                             log?.error('could not push identify update to peer', err);
+                             stream?.abort(err);
+                         }
++                        finally {
++                            // Fix: unwrap pbStream to detach stream event listeners
++                            try { pb?.unwrap().unwrap(); } catch (e) { }
++                        }
+                     };
+                 }
+             }
+@@ -120,8 +125,15 @@ export class IdentifyPush extends AbstractIdentify {
+         const pb = pbStream(stream, {
+             maxDataLength: this.maxMessageSize
+         }).pb(IdentifyMessage);
+-        const message = await pb.read(options);
+-        await stream.close(options);
++        let message;
++        try {
++            message = await pb.read(options);
++            await stream.close(options);
++        }
++        finally {
++            // Fix: unwrap pbStream to detach stream event listeners
++            try { pb.unwrap().unwrap(); } catch (e) { }
++        }
+         await consumeIdentifyMessage(this.components.peerStore, this.components.events, log, connection, message);
+         log.trace('handled push from %p', connection.remotePeer);
+     }
