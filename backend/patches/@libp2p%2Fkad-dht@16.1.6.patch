@@ -1,3 +1,6 @@
+diff --git a/node_modules/@libp2p/kad-dht/.bun-tag-ec146bccba9ea2b5 b/.bun-tag-ec146bccba9ea2b5
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/dist/src/network.js b/dist/src/network.js
 index 9864f98e028bc8b40b757dd73c16aa41f7b5eddb..50a433b13d0f2f3841387d511b8080a012aaea70 100644
 --- a/dist/src/network.js
@@ -47,6 +50,49 @@ index 9864f98e028bc8b40b757dd73c16aa41f7b5eddb..50a433b13d0f2f3841387d511b8080a0
          // tell any listeners about new peers we've seen
          message.closer.forEach(peerData => {
              this.safeDispatchEvent('peer', {
+diff --git a/dist/src/query/manager.js b/dist/src/query/manager.js
+index a547f79a35324e48313dd2a4a2966831831d7bc0..e72d3ce9dfe6955da867f9910e0bd5fdf8afa3bf 100644
+--- a/dist/src/query/manager.js
++++ b/dist/src/query/manager.js
+@@ -94,10 +94,34 @@ export class QueryManager {
+         try {
+             if (this.routingTable.size === 0 && !this.allowQueryWithZeroPeers) {
+                 log('routing table was empty, waiting for some peers before running%s query', options.isSelfQuery === true ? ' self' : '');
+-                // wait to discover at least one DHT peer that isn't us
+-                await pEvent(this.routingTable, 'peer:add', {
+-                    signal,
+-                    filter: (event) => !this.peerId.equals(event.detail)
++                // wait to discover at least one DHT peer that isn't us.
++                // Explicit listener management avoids a Multiaddr retention leak
++                // observed in Bun/JSC: p-event's {once:true} abort-listener is
++                // retained on the native AbortSignal after resolve, anchoring
++                // the pEventMultiple closure (items[], onItem, rejectHandler,
++                // cancel) and its Promise(fulfilled:Array(1)) → PeerInfo →
++                // Multiaddr[] chain. Explicit removeEventListener in cleanup
++                // works across runtimes.
++                const self = this;
++                await new Promise((resolve, reject) => {
++                    const onPeer = (event) => {
++                        if (self.peerId.equals(event.detail)) return;
++                        cleanup();
++                        resolve();
++                    };
++                    const onAbort = () => {
++                        cleanup();
++                        reject(signal.reason ?? new Error('Aborted'));
++                    };
++                    const cleanup = () => {
++                        self.routingTable.removeEventListener('peer:add', onPeer);
++                        signal.removeEventListener('abort', onAbort);
++                    };
++                    self.routingTable.addEventListener('peer:add', onPeer);
++                    signal.addEventListener('abort', onAbort, { once: true });
++                    if (signal.aborted) {
++                        onAbort();
++                    }
+                 });
+                 log('routing table has peers, continuing with%s query', options.isSelfQuery === true ? ' self' : '');
+             }
 diff --git a/dist/src/rpc/index.js b/dist/src/rpc/index.js
 index de8a062a57f4a0b3a10dbc58e1e1e11b959b9524..1a8e8f588c13a1f318232c979d640da1954c6e31 100644
 --- a/dist/src/rpc/index.js
