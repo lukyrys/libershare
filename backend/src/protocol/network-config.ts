@@ -110,12 +110,14 @@ export function buildLibp2pConfig(params: BuildConfigParams): BuildConfigResult 
 				fanoutTTL: 60000,
 				runOnLimitedConnection: true,
 			}),
-			// Phase C Test 1: kadDHT SERVER MODE restored for A/B testing.
-			// Build-time sed patch in rpc/index.js will short-circuit
-			// onIncomingStream to isolate whether the leak is in stream
-			// processing (while loop) or in peer discovery / topology.
+			// Multiaddr leak fix (heap-verified via retention path analysis):
+			// - clientMode:true → no incoming DHT RPC (eliminates onIncomingStream path)
+			// - allowQueryWithZeroPeers:true → bypasses leaky pEvent(routingTable,'peer:add')
+			//   in query/manager.js:98 which retains 99.9% of Multiaddr instances via
+			//   p-event's abort-listener closure in Bun/JSC runtime
 			dht: kadDHT({
-				clientMode: false,
+				clientMode: true,
+				allowQueryWithZeroPeers: true,
 				initialQuerySelfInterval: 3600000,
 				querySelfInterval: 3600000,
 			}),
