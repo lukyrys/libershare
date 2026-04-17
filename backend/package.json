@@ -33,7 +33,10 @@
 		"uint8arrays": "^5.1.0"
 	},
 	"overrides": {
-		"@multiformats/multiaddr": "^12.1.14"
+		"@multiformats/multiaddr": "^12.1.14",
+		"@libp2p/kad-dht": "16.1.6",
+		"@libp2p/identify": "4.0.13",
+		"@libp2p/dcutr": "3.0.14"
 	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
