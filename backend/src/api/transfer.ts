@@ -9,7 +9,7 @@ import { isBusy } from './busy.ts';
 import { ErrorRecovery } from './error-recovery.ts';
 import type { Settings } from '../settings.ts';
 import { Utils } from '../utils.ts';
-import { setPeerEmit, startPeerEmitter, subscribePeers, unsubscribePeers, unsubscribeAllPeers, getDebugSnapshot } from '../protocol/peer-tracker.ts';
+import { setPeerEmit, startPeerEmitter, subscribePeers, unsubscribePeers, getDebugSnapshot } from '../protocol/peer-tracker.ts';
 const assert = Utils.assertParams;
 type EmitFn = (client: any, event: string, data: any) => void;
 type BroadcastFn = (event: string, data: any) => void;
@@ -42,16 +42,21 @@ export function initDownloadState(enabled: Set<string>, persistFn: PersistDownlo
 	persistDownloadEnabled = persistFn;
 }
 
-export function getDownloadEnabledLishs(): Set<string> { return downloadEnabledLishs; }
-export function isDownloadEnabled(lishID: string): boolean { return downloadEnabledLishs.has(lishID); }
-export function markDownloadEnabled(lishID: string): void { downloadEnabledLishs.add(lishID); persistDownloadEnabled?.(lishID, true); }
+export function getDownloadEnabledLishs(): Set<string> {
+	return downloadEnabledLishs;
+}
+export function isDownloadEnabled(lishID: string): boolean {
+	return downloadEnabledLishs.has(lishID);
+}
+export function markDownloadEnabled(lishID: string): void {
+	downloadEnabledLishs.add(lishID);
+	persistDownloadEnabled?.(lishID, true);
+}
 let _activeDownloaders: Map<string, any> | null = null;
-export function setActiveDownloadersRef(ref: Map<string, any>): void { _activeDownloaders = ref; }
+export function setActiveDownloadersRef(ref: Map<string, any>): void {
+	_activeDownloaders = ref;
+}
 
-/**
- * Memory trace source: aggregate Downloader fleet counts. Pulls per-instance
- * state via Downloader.getMemTraceStats() when available.
- */
 export function getDownloaderFleetMemTraceStats(): Record<string, number> {
 	const map = _activeDownloaders;
 	const stats: Record<string, number> = {
@@ -104,12 +109,18 @@ export async function removeDownloadState(lishID: string): Promise<void> {
 
 /** Stop error recovery for a LISH (call when LISH is deleted). */
 let _stopRecoveryFn: ((lishID: string) => void) | null = null;
-export function setStopRecoveryFn(fn: (lishID: string) => void): void { _stopRecoveryFn = fn; }
-export function stopRecoveryForLISH(lishID: string): void { _stopRecoveryFn?.(lishID); }
+export function setStopRecoveryFn(fn: (lishID: string) => void): void {
+	_stopRecoveryFn = fn;
+}
+export function stopRecoveryForLISH(lishID: string): void {
+	_stopRecoveryFn?.(lishID);
+}
 
 /** Restart download for a LISH if it was enabled. Called after busy state clears. */
 let _enableDownloadFn: ((p: { lishID: string }) => Promise<{ success: boolean }>) | null = null;
-export function setEnableDownloadFn(fn: (p: { lishID: string }) => Promise<{ success: boolean }>): void { _enableDownloadFn = fn; }
+export function setEnableDownloadFn(fn: (p: { lishID: string }) => Promise<{ success: boolean }>): void {
+	_enableDownloadFn = fn;
+}
 export function restartDownloadIfEnabled(lishID: string): void {
 	if (downloadEnabledLishs.has(lishID) && _enableDownloadFn) {
 		_enableDownloadFn({ lishID }).catch(() => {});
@@ -123,7 +134,7 @@ export function triggerEnableDownload(lishID: string): void {
 	}
 }
 
-export function initTransferHandlers(networks: Networks, dataServer: DataServer, dataDir: string, emit: EmitFn, broadcast?: BroadcastFn, settings?: Settings, triggerVerification?: (lishID: string) => void): TransferHandlers {
+export function initTransferHandlers(networks: Networks, dataServer: DataServer, dataDir: string, emit: EmitFn, broadcast?: BroadcastFn, settings?: Settings, triggerVerification?: (lishID: string) => void, finalizeDownload?: (lishID: string) => Promise<{ success: boolean }>): TransferHandlers {
 	const activeDownloaders = new Map<string, Downloader>();
 	setActiveDownloadersRef(activeDownloaders);
 
@@ -152,9 +163,13 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 			}
 			return ok;
 		},
-		broadcast: (event, data) => { broadcast?.(event, data); },
-		getLISH: (lishID) => dataServer.get(lishID) ?? undefined as any,
-		checkAccess: async (path) => { await access(path, constants.R_OK | constants.W_OK); },
+		broadcast: (event, data) => {
+			broadcast?.(event, data);
+		},
+		getLISH: lishID => dataServer.get(lishID) ?? (undefined as any),
+		checkAccess: async path => {
+			await access(path, constants.R_OK | constants.W_OK);
+		},
 	});
 
 	function startRecoveryIfEnabled(lishID: string, errorCode: string, prev: { downloadEnabled: boolean; uploadEnabled: boolean }): void {
@@ -176,7 +191,7 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 		downloader.setProgressCallback?.((info: { downloadedChunks: number; totalChunks: number; peers: number; bytesPerSecond: number }) => {
 			send('transfer.download:progress', { lishID, ...info });
 		});
-		downloader.setRetryCallback?.((info) => {
+		downloader.setRetryCallback?.(info => {
 			if (info.resolved) send('transfer.download:resumed', { lishID });
 			else send('transfer.download:retrying', { lishID, ...info });
 		});
@@ -267,7 +282,10 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 				for (const file of lish.files) {
 					const filePath = join(lish.directory, file.path);
 					const f = Bun.file(filePath);
-					if (!(await f.exists()) || f.size !== file.size) { diskOk = false; break; }
+					if (!(await f.exists()) || f.size !== file.size) {
+						diskOk = false;
+						break;
+					}
 				}
 				if (!diskOk) {
 					// Files missing on disk — reset ALL chunks and start fresh download
@@ -329,12 +347,24 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 				}
 				send('transfer.download:progress', { lishID: p.lishID, ...info });
 			});
-			downloader.setRetryCallback?.((info) => {
+			downloader.setRetryCallback?.(info => {
 				if (info.resolved) send('transfer.download:resumed', { lishID: p.lishID });
 				else send('transfer.download:retrying', { lishID: p.lishID, ...info });
 			});
-			downloader.download()
-				.then(() => { if (activeDownloaders.get(p.lishID) === downloader) activeDownloaders.delete(p.lishID); send('transfer.download:complete', { downloadDir, lishID: p.lishID }); })
+			downloader
+				.download()
+				.then(async () => {
+					if (activeDownloaders.get(p.lishID) === downloader) activeDownloaders.delete(p.lishID);
+					send('transfer.download:complete', { downloadDir, lishID: p.lishID });
+					// If this LISH was imported into temp, move it to its final directory.
+					if (finalizeDownload) {
+						try {
+							await finalizeDownload(p.lishID);
+						} catch (err) {
+							console.error(`[Transfer] ${p.lishID.slice(0, 8)}: finalizeDownload failed`, err);
+						}
+					}
+				})
 				.catch(err => {
 					if (activeDownloaders.get(p.lishID) === downloader) activeDownloaders.delete(p.lishID);
 					if (err instanceof CodedError && err.code === ErrorCodes.DOWNLOAD_CANCELLED) return;
@@ -370,12 +400,12 @@ export function initTransferHandlers(networks: Networks, dataServer: DataServer,
 
 	// Register enableDownload for module-level restartDownloadIfEnabled
 	setEnableDownloadFn(enableDownload);
-	setStopRecoveryFn((lishID) => recovery.stop(lishID));
+	setStopRecoveryFn(lishID => recovery.stop(lishID));
 	// Hook upload I/O errors into download recovery
 	setUploadRecoveryHooks(
 		(lishID, errorCode, prev) => startRecoveryIfEnabled(lishID, errorCode, prev),
-		(lishID) => downloadEnabledLishs.has(lishID),
-		triggerVerification,
+		lishID => downloadEnabledLishs.has(lishID),
+		triggerVerification
 	);
 
 	function getActiveTransfers(): ActiveTransfer[] {
